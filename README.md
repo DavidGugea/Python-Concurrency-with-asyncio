@@ -453,5 +453,4 @@ Now imagine once Task 3 pauses to wait for its I/O to complete, the web request 
 
 In figure 1.10, we show the execution flow of the pseudocode we just described. If we look at any vertical slice of this diagram, we can see that only one CPU-bound piece of work is running at any given time; however, we have up to two I/O-bound operations happening concurrently. This overlapping of waiting for I/O per each task is where the real time savings of asyncio comes in.
 
-![Figure-1-10](ScreenshotsForNotes/Chapter1/Figure_1_10.PNG
-
+![Figure-1-10](ScreenshotsForNotes/Chapter1/Figure_1_10.PNG)
