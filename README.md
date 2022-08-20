@@ -454,3 +454,847 @@ Now imagine once Task 3 pauses to wait for its I/O to complete, the web request 
 In figure 1.10, we show the execution flow of the pseudocode we just described. If we look at any vertical slice of this diagram, we can see that only one CPU-bound piece of work is running at any given time; however, we have up to two I/O-bound operations happening concurrently. This overlapping of waiting for I/O per each task is where the real time savings of asyncio comes in.
 
 ![Figure-1-10](ScreenshotsForNotes/Chapter1/Figure_1_10.PNG)
+
+# 2. asyncio basics
+
+## Introduction Coroutines
+
+Think of a coroutine like a regular Python function but with the superpower that it can pause its execution when it encounters an operation that could take a while to complete. When that long-running operation is complete, we can “wake up” our paused coroutine and finish executing any other code in that coroutine. While a paused coroutine is waiting for the operation it paused for to finish, we can run other code. This running of other code while waiting is what gives our application concurrency. We can also run several time-consuming operations concurrently, which can give our applications big performance improvements.
+
+To both create and pause a coroutine, we’ll need to learn to use Python’s ```async``` and ```await``` keywords. The async keyword will let us define a coroutine; the await keyword will let us pause our coroutine when we have a long-running operation.
+
+## Creating coroutines with the ```async``` keyword
+
+Creating a coroutine is straightforward and not much different from creating a normal Python function. The only difference is that, instead of using the def keyword, we use async def. The async keyword marks a function as a coroutine instead of a normal Python function.
+
+```Python3
+async def my_coroutine() -> None:
+    print('Hello world!')
+```
+
+The coroutine in the preceding listing does nothing yet other than print “Hello world!” It’s also worth noting that this coroutine does not perform any long-running operations; it just prints our message and returns. This means that, when we put the coroutine on the event loop, it will execute immediately because we don’t have any blocking I/O, and nothing is pausing execution yet.
+
+This syntax is simple, but we’re creating something very different from a plain Python function. To illustrate this, let’s create a function that adds one to an integer as well as a coroutine that does the same and compare the results of calling each. We’ll also use the type convenience function to look at the type returned by calling a coroutine as compared to calling our normal function.
+
+```Python3
+async def coroutine_add_one(number: int) -> int:
+  return number + 1
+
+
+def add_one(number: int) -> int:
+  return number + 1
+
+
+function_result = add_one(1)
+coroutine_result = coroutine_add_one(1)
+
+print("Function result is {0} and the type is {1}".format(function_result, type(function_result)))
+print("Function result is {0} and the type is {1}".format(coroutine_result, type(coroutine_result)))
+```
+
+When we run this code, we’ll see output like the following:
+
+```
+Method result is 2 and the type is <class 'int'>
+Coroutine result is <coroutine object coroutine_add_one at 0x1071d6040> and
+the type is <class 'coroutine'>
+```
+
+Notice how when we call our normal add_one function it executes immediately and returns what we would expect, another integer. However, when we call coroutine_ add_one we don’t get our code in the coroutine executed at all. We get a coroutine object instead.
+
+This is an important point, as coroutines aren’t executed when we call them directly. Instead, we create a coroutine object that can be run later. To run a coroutine, we need to explicitly run it on an event loop. So how can we create an event loop and run our coroutine?
+
+In versions of Python older than 3.7, we had to create an event loop if one did not already exist. However, the asyncio library has added several functions that abstract the event loop management. There is a convenience function, asyncio.run, we can use to run our coroutine. This is illustrated in the following listing.
+
+```Python3
+import asyncio
+
+
+async def coroutine_add_one(number: int) -> int:
+  return number + 1
+
+
+result = asyncio.run(coroutine_add_one(1))
+
+print(result)
+```
+
+Running listing 2.3 will print “2,” as we would expect for returning the next integer. We’ve properly put our coroutine on the event loop, and we have executed it!
+
+asyncio.run is doing a few important things in this scenario. First, it creates a brand-new event. Once it successfully does so, it takes whichever coroutine we pass into it and runs it until it completes, returning the result. This function will also do some cleanup of anything that might be left running after the main coroutine finishes. Once everything has finished, it shuts down and closes the event loop.
+
+Possibly the most important thing about asyncio.run is that it is intended to be the main entry point into the asyncio application we have created. It only executes one coroutine, and that coroutine should launch all other aspects of our application. As we progress further, we will use this function as the entry point into nearly all our applications. The coroutine that asyncio.run executes will create and run other coroutines that will allow us to utilize the concurrent nature of asyncio.
+
+## Pausing execution with the ```await``` keyword
+
+The example we saw in listing 2.3 did not need to be a coroutine, as it executed only non-blocking Python code. The real benefit of asyncio is being able to pause execution to let the event loop run other tasks during a long-running operation. To pause execution, we use the await keyword. The await keyword is usually followed by a call to a coroutine (more specifically, an object known as an awaitable, which is not always a coroutine; we’ll learn more about awaitables later in the chapter).
+
+Using the await keyword will cause the coroutine following it to be run, unlike calling a coroutine directly, which produces a coroutine object. The await expression will also pause the coroutine where it is contained in until the coroutine we awaited finishes and returns a result. When the coroutine we awaited finishes, we’ll have access to the result it returned, and the containing coroutine will “wake up” to handle the result.
+
+We can use the await keyword by putting it in front of a coroutine call. Expanding on our earlier program, we can write a program where we call the add_one function inside of a “main” async function and get the result.
+
+```Python3
+import asyncio
+
+
+async def add_one(number: int) -> int:
+  return number + 1
+
+
+async def main() -> None:
+  one_plus_one = await add_one(1)
+  two_plus_one = await add_one(2)
+  print(one_plus_one)
+  print(two_plus_one)
+
+
+asyncio.run(main())
+```
+
+In listing 2.4, we pause execution twice. We first await the call to add_one(1). Once we have the result, the main function will be “unpaused,” and we will assign the return value from add_one(1) to the variable one_plus_one, which in this case will be two. We then do the same for add_one(2) and then print the results. We can visualize the execution flow of our application, as shown in figure 2.1. Each block of the figure represents what is happening at any given moment for one or more lines of code.
+
+![Figure-2-1](ScreenshotsForNotes/Chapter2/Figure_2_1.PNG)
+
+As it stands now, this code does not operate differently from normal, sequential code. We are, in effect, mimicking a normal call stack. Next, let’s look at a simple example of how to run other code by introducing a dummy sleep operation while we’re waiting.
+
+## Introducing long-running coroutines with sleep
+
+Our previous examples did not use any slow operations and were used to help us learn the basic syntax of coroutines. To fully see the benefits and show how we can run multiple events simultaneously, we’ll need to introduce some long-running operations. Instead of making web API or database queries right away, which are nondeterministic as to how much time they will take, we’ll simulate long-running operations by specifying how long we want to wait. We’ll do this with the asyncio.sleep function.
+
+We can use asyncio.sleep to make a coroutine “sleep” for a given number of seconds. This will pause our coroutine for the time we give it, simulating what would happen if we had a long-running call to a database or web API.
+
+```asyncio.sleep``` is itself a coroutine, so we must use it with the await keyword. If we call it just by itself, we’ll get a coroutine object. Since asyncio.sleep is a coroutine, this means that when a coroutine awaits it, other code will be able to run.
+
+Let’s examine a simple example, shown in the following listing, that sleeps for 1 second and then prints a 'Hello World!' message.
+
+```Python3
+import asyncio
+
+
+async def hello_world_message() -> str:
+  await asyncio.sleep(1)
+  return 'Hello World!'
+
+
+async def main() -> None:
+  message = await hello_world_message()
+  print(message)
+
+
+asyncio.run(main())
+```
+
+When we run this application, our program will wait 1 second before printing our 'Hello World!' message. Since hello_world_message is a coroutine and we pause it for 1 second with asyncio.sleep, we now have 1 second where we could be running other code concurrently.
+
+We’ll be using sleep a lot in the next few examples, so let’s invest the time to create a reusable coroutine that sleeps for us and prints out some useful information. We’ll call this coroutine delay. This is shown in the following listing.
+
+```Python3
+import asyncio
+
+async def delay(delay_seconds: int) -> int:
+  print("Sleeping for {0} second(s)".format(delay_seconds))
+  await asyncio.sleep(delay_seconds)
+  print("Finished sleeping for {0} second(s)".format(delay_seconds))
+  return delay_seconds
+```
+
+delay will take in an integer of the duration in seconds that we’d like the function to sleep and will return that integer to the caller once it has finished sleeping. We’ll also print when sleep begins and ends. This will help us see what other code, if any, is running concurrently while our coroutines are paused.
+
+### Running two coroutines
+
+```Python3
+import asyncio
+from util import delay
+
+
+async def add_one(number: int) -> int:
+  return number + 1
+
+
+async def hello_word_message() -> str:
+  await delay(1)
+  return 'Hello World!'
+
+
+async def main() -> None:
+  message = await hello_word_message()
+  one_plus_one = await add_one(1)
+  print(one_plus_one)
+  print(message)
+
+
+asyncio.run(main())
+```
+
+When we run this, 1 second passes before the results of both function calls are printed. What we really want is the value of add_one(1) to be printed immediately while hello_world_message()runs concurrently. So why isn’t this happening with this code? The answer is that await pauses our current coroutine and won’t execute any other code inside that coroutine until the await expression gives us a value. Since it will take 1 second for our hello_world_message function to give us a value, the main coroutine will be paused for 1 second. Our code behaves as if it were sequential in this case. This behavior is illustrated in figure 2.2.
+
+![Figure-2-2](ScreenshotsForNotes/Chapter2/Figure_2_2.PNG)
+
+Both main and hello_world paused while we wait for delay(1) to finish. After it has finished, main resumes and can execute add_one.
+
+We’d like to move away from this sequential model and run add_one concurrently with hello_world. To achieve this, we’ll need to introduce a concept called tasks.
+
+## Running concurrently with tasks
+
+Earlier we saw that, when we call a coroutine directly, we don’t put it on the event loop to run. Instead, we get a coroutine object that we then need to either use the await keyword on it or pass it in to asyncio.run to run and get a value. With only these tools we can write async code, but we can’t run anything concurrently. To run coroutines concurrently, we’ll need to introduce tasks.
+
+Tasks are wrappers around a coroutine that schedule a coroutine to run on the event loop as soon as possible. This scheduling and execution happen in a non-blocking fashion, meaning that, once we create a task, we can execute other code instantly while the task is running. This contrasts with using the await keyword that acts in a blocking manner, meaning that we pause the entire coroutine until the result of the await expression comes back.
+
+The fact that we can create tasks and schedule them to run instantly on the event loop means that we can execute multiple tasks at roughly the same time. When these tasks wrap a long-running operation, any waiting they do will happen concurrently. To illustrate this, let’s create two tasks and try to run them at the same time.
+
+## The basics of creating tasks
+
+Creating a task is achieved by using the asyncio.create_task function. When we call this function, we give it a coroutine to run, and it returns a task object instantly. Once we have a task object, we can put it in an await expression that will extract the return value once it is complete.
+
+```Python3
+import asyncio
+from util import delay
+
+
+async def main():
+  sleep_for_three = asyncio.create_task(delay(3))
+  print(type(sleep_for_three))
+  result = await sleep_for_three
+  print(result)
+
+
+async def test_main():
+  print("hello world")
+  sleep_for_three = await delay(3)
+  print(type(sleep_for_three))
+
+asyncio.run(test_main())
+```
+
+In the preceding listing, we create a task that requires 3 seconds to complete. We also print out the type of the task, in this case, <class '_asyncio.Task'>, to show that it is different from a coroutine.
+
+One other thing to note here is that our print statement is executed immediately after we run the task. If we had simply used await on the delay coroutine we would have waited 3 seconds before outputting the message.
+
+Once we’ve printed our message, we apply an await expression to the task sleep_ for_three. This will suspend our main coroutine until we have a result from our task.
+
+It is important to know that we should usually use an await keyword on our tasks at some point in our application. In listing 2.8, if we did not use await, our task would be scheduled to run, but it would almost immediately be stopped and “cleaned up” when asyncio.run shut down the event loop. Using await on our tasks in our application also has implications for how exceptions are handled, which we’ll look at in chapter 3. Now that we’ve seen how to create a task and allow other code to run concurrently, we can learn how to run multiple long-running operations at the same time.
+
+## Running multiple tasks concurrently
+
+Given that tasks are created instantly and are scheduled to run as soon as possible, this allows us to run many long-running tasks concurrently. We can do this by sequentially starting multiple tasks with our long-running coroutine.
+
+```Python3
+import asyncio
+from util import delay
+
+
+async def main():
+  sleep_for_three = asyncio.create_task(delay(3))
+  sleep_again = asyncio.create_task(delay(3))
+  sleep_once_more = asyncio.create_task(delay(3))
+
+  await sleep_for_three
+  await sleep_again
+  await sleep_once_more
+
+
+asyncio.run(main())
+```
+
+In the preceding listing we start three tasks, each taking 3 seconds to complete. Each call to create_task returns instantly, so we reach the await sleep_for_three statement right away. Previously, we mentioned that tasks are scheduled to run “as soon as possible.” Generally, this means the first time we hit an await statement after creating a task, any tasks that are pending will run as await triggers an iteration of the event loop.
+
+Since we’ve hit await sleep_for_three, all three tasks start running and will carry out any sleep operations concurrently. This means that the program in listing 2.9 will complete in about 3 seconds. We can visualize the concurrency as shown in figure 2.3, noting that all three tasks are running their sleep coroutines at the same time.
+
+Note that in figure 2.3 the code in the tasks labeled RUN delay(3) (in this case, some print statements) does not run concurrently with other tasks; only the sleep coroutines run concurrently. If we were to run these delay operations sequentially, we’d have an application runtime of just over 9 seconds. By doing this concurrently, we’ve decreased the total runtime of this application three-fold!
+
+![Figure-2-3](ScreenshotsForNotes/Chapter2/Figure_2_3.PNG)
+
+This benefit compounds as we add more tasks; if we had launched 10 of these tasks, we would still take roughly 3 seconds, giving us a 10-fold speedup.
+
+Executing these long-running operations concurrently is where asyncio really shines and delivers drastic improvements in our application’s performance, but the benefits don’t stop there. In listing 2.9, our application was actively doing nothing, while it was waiting for 3 seconds for our delay coroutines to complete. While our code is waiting, we can execute other code. As an example, let’s say we wanted to print out a status message every second while we were running some long tasks.
+
+```Python3
+import asyncio
+from util import delay
+
+
+async def hello_every_second() -> None:
+  for _ in range(9):
+    await asyncio.sleep(1)
+    print("I'm running other code while I'm waiting!")
+
+
+async def main() -> None:
+  first_delay = asyncio.create_task(delay(3))
+  second_delay = asyncio.create_task(delay(3))
+
+  await hello_every_second()
+  await first_delay
+  await second_delay
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we create two tasks, each of which take 3 seconds to complete. While these tasks are waiting, our application is idle, which gives us the opportunity to run other code. In this instance, we run a coroutine hello_every_second, which prints a message every second 2 times. While our two tasks are running, we’ll see messages being output, giving us the following:
+
+```
+sleeping for 3 second(s)
+sleeping for 3 second(s)
+I'm running other code while I'm waiting!
+I'm running other code while I'm waiting!
+finished sleeping for 3 second(s)
+finished sleeping for 3 second(s)
+```
+
+We can imagine the execution flow as shown in figure 2.4.
+
+![Figure-2-4](ScreenshotsForNotes/Chapter2/Figure_2_4.PNG)
+
+First, we start two tasks that sleep for 3 seconds; then, while our two tasks are idle, we start to see I’m running other code while I’m waiting! being printed every second. This means that even when we’re running time-intensive operations, our application can still be performing other tasks.
+
+One potential issue with tasks is that they can take an indefinite amount of time to complete. We could find ourselves wanting to stop a task if it takes too long to finish. Tasks support this use case by allowing cancellation.
+
+## Canceling tasks and setting timeouts
+
+Network connections can be unreliable. A user’s connection may drop because of a network slowdown, or a web server may crash and leave existing requests in limbo. When making one of these requests, we need to be especially careful that we don’t wait indefinitely. Doing so could lead to our application hanging, waiting forever for a result that may never come. It could also lead to a poor user experience; if we allow a user to make a request that takes too long, they are unlikely to wait forever for a response. Additionally, we may want to allow our users a choice if a task continues torun. A user may proactively decide things are taking too long, or they may want to stop a task they made in error.
+
+In our previous examples, if our tasks took forever, we would be stuck waiting for the await statement to finish with no feedback. We also had no way to stop things if we wanted to. asyncio supports both these situations by allowing tasks to be canceled as well as allowing them to specify a timeout.
+
+## Canceling tasks
+
+Canceling a task is straightforward. Each task object has a method named cancel, which we can call whenever we’d like to stop a task. Canceling a task will cause that task to raise a CancelledError when we await it, which we can then handle as needed.
+
+To illustrate this, let’s say we launch a long-running task that we don’t want to run for longer than 5 seconds. If the task is not completed within 5 seconds, we’d like to stop that task, reporting back to the user that it took too long and we’re stopping it. We also want a status update printed every second, to provide up-to-date information to our user, so they aren’t left without information for several seconds.
+
+```Python3
+import asyncio
+from asyncio import CancelledError
+from util import delay
+
+
+async def main():
+  long_task = asyncio.create_task(delay(10))
+
+  seconds_elapsed = 0
+
+  while not long_task.done():
+    print("Task not finished, checking again in a second.")
+    await asyncio.sleep(1)
+    seconds_elapsed += 1
+    if seconds_elapsed == 5:
+      long_task.cancel()
+
+  try:
+    await long_task
+  except CancelledError:
+    print('Our task was cancelled')
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we create a task that will take 10 seconds to run. We then create a while loop to check if that task is done. The done method on the task returns True if a task is finished and False otherwise. Every second, we check to see if the task has finished, keeping track of how many seconds we’ve checked so far. If our task has taken5 seconds, we cancel the task. Then, we will go on to await long_task, and we’ll see Our task was cancelled printed out, indicating we’ve caught a CancelledError.
+
+Something important to note about cancellation is that a CancelledError can only be thrown from an await statement. This means that if we call cancel on a task when it is executing plain Python code, that code will run until completion until we hit the next await statement (if one exists) and a CancelledError can be raised. Calling cancel won’t magically stop the task in its tracks; it will only stop the task if you’re currently at an await point or its next await point.
+
+## Setting a timeout and canceling with a ```wait_for```
+
+Checking every second or at some other time interval, and then canceling a task, as we did in the previous example, isn’t the easiest way to handle a timeout. Ideally, we’d have a helper function that would allow us to specify this timeout and handle cancellation for us.
+
+asyncio provides this functionality through a function called asyncio.wait_for. This function takes in a coroutine or task object, and a timeout specified in seconds. It then returns a coroutine that we can await. If the task takes more time to complete than the timeout we gave it, a TimeoutException will be raised. Once we have reached the timeout threshold, the task will automatically be canceled.
+
+To illustrate how wait_for works, we’ll look at a case where we have a task that will take 2 seconds to complete, but we’ll only allow it 1 second to finish. When we get a TimeoutError raised, we’ll catch the exception and check to see if the task was canceled.
+
+```Python3
+import asyncio
+from util import delay
+
+
+async def main():
+  delay_task = asyncio.create_task(delay(2))
+
+  try:
+    result = await asyncio.wait_for(delay_task, timeout=1)
+    print(result)
+  except asyncio.exceptions.TimeoutError:
+    print("Got a timeout!")
+    print('Was the task cancelled ? {0}'.format(delay_task.cancelled()))
+
+
+asyncio.run(main())
+```
+
+When we run the preceding listing, our application will take roughly 1 second to complete. After 1 second our wait_for statement will raise a TimeoutError, which we then handle. We’ll then see that our original delay task was canceled, giving the following output:
+
+```
+sleeping for 2 second(s)
+Got a timeout!
+Was the task cancelled? True
+```
+
+Canceling tasks automatically if they take longer than expected is normally a good idea. Otherwise, we may have a coroutine waiting indefinitely, taking up resources that may never be released. However, in certain circumstances we may want to keep our coroutine running. For example, we may want to inform a user that something is taking longer than expected after a certain amount of time but not cancel the task when the timeout is exceeded.
+
+To do this we can wrap our task with the asyncio.shield function. This function will prevent cancellation of the coroutine we pass in, giving it a “shield,” which cancellation requests then ignore.
+
+```Python3
+import asyncio
+from util import delay
+
+
+async def main():
+  task = asyncio.create_task(delay(10))
+
+  try:
+    result = await asyncio.wait_for(asyncio.shield(task), 5)
+    print(result)
+  except asyncio.exceptions.TimeoutError:
+    print('Task took longer than five seconds, it will finish soon!')
+    result = await task
+    print(result)
+
+
+asyncio.run(main())
+``` 
+
+In the preceding listing, we first create a task to wrap our coroutine. This differs from our first cancellation example because we’ll need to access the task in the except block. If we had passed in a coroutine, wait_for would have wrapped it in a task, but we wouldn’t be able to reference it, as it is internal to the function.
+
+Then, inside of a try block, we call wait_for and wrap the task in shield, which will prevent the task from being canceled. Inside our exception block, we print a useful message to the user, letting them know that the task is still running and then we await the task we initially created. This will let it finish in its entirety, and the program’s output will be as follows:
+
+```
+sleeping for 10 second(s)
+Task took longer than five seconds!
+finished sleeping for 10 second(s)
+finished <function delay at 0x10e8cf820> in 10 second(s)
+```
+
+Cancellation and shielding are somewhat tricky subjects with several cases that are noteworthy. We introduce the basics below, but as we get into more complicated cases, we’ll explore how cancellation works in greater depth.
+
+## Tasks, coroutines, futures, and awaitables
+
+Coroutines and tasks can both be used in await expressions. So what is the common thread between them? To understand, we’ll need to know about both a future as well as an awaitable. You normally won’t need to use futures, but understanding them is a key to understanding the inner workings of asyncio. As some APIs return futures, we will reference them in the rest of the book.
+
+## Introducing futures
+
+A future is a Python object that contains a single value that you expect to get at some point in the future but may not yet have. Usually, when you create a future, it does not have any value it wraps around because it doesn’t yet exist. In this state, it is considered incomplete, unresolved, or simply not done. Then, once you get a result, you can set the value of the future. This will complete the future; at that time, we can consider it finished and extract the result from the future. To understand the basics of futures, let’s try creating one, setting its value and extracting that value back out.
+
+```Python3
+from asyncio import Future
+
+my_future = Future()
+
+print('Is my_future done? {0}'.format(my_future.done()))
+
+my_future.set_result(42)
+
+print('Is my_future done? {0}'.format(my_future.done()))
+print('What is the result of my_future? {0}'.format(my_future.result()))
+```
+
+We can create a future by calling its constructor. At this time, the future will have no result set on it, so calling its done method will return False. We then set the value of the future with its set_result method, which will mark the future as done. Alternatively, if we had an exception we wanted to set on the future, we could call set_exception.
+
+***We don’t call the result method before the result is set because the result method will throw an invalid state exception if we do so.***
+
+Futures can also be used in await expressions. If we await a future, we’re saying “pause until the future has a value set that I can work with, and once I have a value, wake up and let me process it.”
+
+To understand this, let’s consider an example of making a web request that returns a future. Making a request that returns a future should complete instantly, but as the request will take some time, the future will not yet be defined. Then, later, once the request has finished, the result will be set, then we can access it. If you have used JavaScript in the past, this concept is analogous to promises. In the Java world, these are known as completable futures.
+
+```Python3
+from asyncio import Future
+import asyncio
+
+
+def make_request() -> Future:
+  future = Future()
+  asyncio.create_task(set_future_value(future))
+  return future
+
+
+async def set_future_value(future: asyncio.Future) -> None:
+  await asyncio.sleep(1)
+  future.set_result(42)
+
+
+async def main():
+  future = make_request()
+  print('Is the future done? {0}'.format(future.done()))
+  value = await future
+  print('Is the future done? {0}'.format(future.done()))
+  print(value)
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we define a function make_request. In that function we create a future and create a task that will asynchronously set the result of the future after 1 second. Then, in the main function, we call make_request. When we call this, we’ll instantly get a future with no result; it is, therefore, undone. Then, we await the future. Awaiting this future will pause main for 1 second while we wait for the value of the future to be set. Once this completes, value will be 42 and the future is done.
+
+In the world of asyncio, you should rarely need to deal with futures. That said, you will run into some asyncio APIs which return futures, and you may need to work with callback-based code, which can require futures. You may also need to read or debug some asyncio API code yourself. The implementation of these asyncio APIs heavily rely on futures, so it is ideal to have a basic understanding of how they work.
+
+## The relationship between futures, tasks, and coroutines
+
+There is a strong relationship between tasks and futures. In fact, task directly inherits from future. A future can be thought as representing a value that we won’t have for a while. A task can be thought as a combination of both a coroutine and a future. When we create a task, we are creating an empty future and running the coroutine. Then, when the coroutine has completed with either an exception or a result, we set the result or exception of the future.
+
+Given the relationship between futures and tasks, is there a similar relationship between tasks and coroutines? After all, all these types can be used in await expressions.
+
+The common thread between these is the Awaitable abstract base class. This class defines one abstract double underscore method __await__. We won’t go into the specifics about how to create our own awaitables, but anything that implements the __await__ method can be used in an await expression. Coroutines inherit directly from Awaitable, as do futures. Tasks then extend futures, which gives us the inheritance diagram shown in figure 2.5.
+
+![Figure-2-5](ScreenshotsForNotes/Chapter2/Figure_2_5.PNG)
+
+Going forward, we’ll start to refer to objects that can be used in await expressions as awaitables. You’ll frequently see the term awaitable referenced in the asyncio documentation, as many API methods don’t care if you pass in coroutines, tasks, or futures.
+
+Now that we understand the basics of coroutines, tasks, and futures, how do we assess their performance? So far, we’ve only theorized about how long they take. To make things more rigorous, let’s add some functionality to measure execution time.
+
+## Measuring coroutine executing time with decorators
+
+So far, we’ve talked about roughly how long our applications take to run without timing them. To really understand and profile things we’ll need to introduce some code to keep track of this for us.
+
+As a first try we could wrap every await statement and keep track of the start and end time of the coroutine:
+
+```Python3
+import asyncio
+import time
+
+async def main():
+  start = time.time()
+  await asyncio.sleep(1)
+  end = time.time()
+  print(f'Sleeping took {end - start} seconds')
+  
+asyncio.run(main())
+```
+
+However, this will get messy quickly when we have multiple await statements and tasks to keep track of. A better approach is to come up with a reusable way to keep track of how long any coroutine takes to finish. We can do this by creating a decorator that will run an await statement for us (listing 2.16). We’ll call this decorator async_timed.
+
+```Python3
+import functools
+import time
+from typing import Callable, Any
+
+
+def async_timed():
+  def wrapper(func: Callable) -> Callable:
+    @functools.wraps(func)
+    async def wrapped(*args, **kwargs) -> Any:
+      print('starting {0} with args {1} {2}'.format(func, args, kwargs))
+      start = time.time()
+
+      try:
+        return await func(*args, **kwargs)
+      finally:
+        end = time.time()
+        total = end - start
+        print('finished {0} in {1:.4f} second(s)'.format(func, total))
+
+    return wrapped
+
+  return wrapper
+```
+
+In this decorator, we create a new coroutine called wrapped. This is a wrapper around our original coroutine that takes its arguments, *args and **kwargs, calls an await statement, and then returns the result. We surround that await statement with one message when we start running the function and another message when we end running the function, keeping track of the start and end time in much the same way that we did in our earlier start-time and end-time example. Now, as shown in listing 2.17, we can put this annotation on any coroutine, and any time we run it, we’ll see how long it took to run.
+
+```Python3
+import asyncio
+from util import async_timed
+
+
+@async_timed()
+async def delay(delay_seconds: int) -> int:
+  print('sleeping for {0} second(s)'.format(delay_seconds))
+  await asyncio.sleep(delay_seconds)
+  print('finished sleeping for {0} second(s)'.format(delay_seconds))
+  return delay_seconds
+
+
+@async_timed()
+async def main():
+  task_one = asyncio.create_task(delay(2))
+  task_two = asyncio.create_task(delay(2))
+
+  await task_one
+  await task_two
+
+
+asyncio.run(main())
+```
+
+When we run the preceding listing, we’ll see console output similar to the following:
+
+```
+starting <function main at 0x109111ee0> with args () {}
+starting <function delay at 0x1090dc700> with args (2,) {}
+starting <function delay at 0x1090dc700> with args (3,) {}
+finished <function delay at 0x1090dc700> in 2.0032 second(s)
+finished <function delay at 0x1090dc700> in 3.0003 second(s)
+finished <function main at 0x109111ee0> in 3.0004 second(s)
+```
+
+We can see that our two delay calls were both started and finished in roughly 2 and 3 seconds, respectively, for a total of 5 seconds. Notice, however, that our main coroutine only took 3 seconds to complete because we were waiting concurrently.
+
+## The pitfalls of coroutines and tasks
+
+When seeing the performance improvements we can obtain from running some of our longer tasks concurrently, we can be tempted to start to use coroutines and tasks everywhere in our applications. While it depends on the application you’re writing, simply marking functions async and wrapping them in tasks may not help application performance. In certain cases, this may degrade performance of your applications.
+
+Two main errors occur when trying to turn your applications asynchronous. The first is attempting to run CPU-bound code in tasks or coroutines without using multiprocessing; the second is using blocking I/O-bound APIs without using multithreading.
+
+## Running CPU-bound code
+
+We may have functions that perform computationally expensive calculations, such as looping over a large dictionary or doing a mathematical computation. Where we have several of these functions with the potential to run concurrently, we may get the idea to run them in separate tasks. In concept, this is a good idea, but remember that asyncio has a single-threaded concurrency model. This means we are still subject to the limitations of a single thread and the global interpreter lock.
+
+To prove this to ourselves, let’s try to run some CPU-bound functions concurrently.
+
+```Python3
+import asyncio
+from util import async_timed, delay
+
+
+@async_timed()
+async def cpu_bound_work() -> int:
+  counter = 0
+
+  for _ in range(100000000):
+    counter += 1
+
+  return counter
+
+
+@async_timed()
+async def main():
+  task_one = asyncio.create_task(cpu_bound_work())
+  task_two = asyncio.create_task(cpu_bound_work())
+
+  await task_one
+  await task_two
+
+
+asyncio.run(main())
+```
+
+When we run the preceding listing, we’ll see that, despite creating two tasks, our code still executes sequentially. First, we run Task 1, then we run Task 2, meaning our total runtime will be the sum of the two calls to cpu_bound_work:
+
+```
+starting <function main at 0x10a8f6c10> with args () {}
+starting <function cpu_bound_work at 0x10a8c0430> with args () {}
+finished <function cpu_bound_work at 0x10a8c0430> in 4.6750 second(s)
+starting <function cpu_bound_work at 0x10a8c0430> with args () {}
+finished <function cpu_bound_work at 0x10a8c0430> in 4.6680 second(s)
+finished <function main at 0x10a8f6c10> in 9.3434 second(s)
+```
+
+Looking at the output above, we may be tempted to think that there are no drawbacks to making all our code use async and await. After all, it ends up taking the same amount of time as if we had run things sequentially. However, by doing this we can run into situations where our application’s performance can degrade. This is especially true when we have other coroutines or tasks that have await expressions. Consider creating two CPU-bound tasks alongside a long-running task, such as our delay coroutine.
+
+```Python3
+import asyncio
+from util import async_timed, delay
+
+
+@async_timed()
+async def cpu_bound_work() -> int:
+  counter = 0
+
+  for _ in range(100000000):
+    counter += 1
+
+  return counter
+
+
+@async_timed()
+async def main():
+  task_one = asyncio.create_task(cpu_bound_work())
+  task_two = asyncio.create_task(cpu_bound_work())
+  delay_task = asyncio.create_task(delay(4))
+
+  await task_one
+  await task_two
+  await delay_task
+
+
+asyncio.run(main())
+```
+
+Running the preceding listing, we might expect to take the same amount of time as in listing 2.18. After all, won’t delay_task run concurrently alongside the CPU-bound work? In this instance it won’t because we create the two CPU-bound tasks first, which, in effect, blocks the event loop from running anything else. This means the runtime of our application will be the sum of time it took for our two cpu_bound_work tasks to finish plus the 4 seconds that our delay task took.
+
+If we need to perform CPU-bound work and still want to use async / await syntax, we can do so. To do this we’ll still need to use multiprocessing, and we need to tell asyncio to run our tasks in a process pool. We’ll learn how to do this in chapter 6.
+
+## Running blocking APIs
+
+We may also be tempted to use our existing libraries for I/O-bound operations by wrapping them in coroutines. However, this will generate the same issues that we saw with CPU-bound operations. These APIs block the main thread. Therefore, when we run a blocking API call inside a coroutine, we’re blocking the event loop thread itself, meaning that we stop any other coroutines or tasks from executing. Examples of blocking API calls include libraries such as requests, or time.sleep. Generally, any function that performs I/O that is not a coroutine or performs time-consuming CPU operations can be considered blocking.
+
+As an example, let’s try getting the status code of www.example.com three times concurrently, using the requests library. When we run this, since we’re running concurrently we’ll be expecting this application to finish in about the length of time necessary to get the status code once.
+
+```Python3
+import asyncio
+import requests
+from util import async_timed
+
+
+@async_timed()
+async def get_example_status() -> int:
+  return requests.get('http://www.example.com').status_code
+
+
+@async_timed()
+async def main():
+  task_1 = asyncio.create_task(get_example_status())
+  task_2 = asyncio.create_task(get_example_status())
+  task_3 = asyncio.create_task(get_example_status())
+
+  await task_1
+  await task_2
+  await task_3
+
+
+asyncio.run(main())
+```
+
+When running the preceding listing, we’ll see output similar to the following. Note how the total runtime of the main coroutine is roughly the sum of time for all the tasks to get the status we ran, meaning that we did not have any concurrency advantage:
+
+```
+starting <function main at 0x1102e6820> with args () {}
+starting <function get_example_status at 0x1102e6700> with args () {}
+finished <function get_example_status at 0x1102e6700> in 0.0839 second(s)
+starting <function get_example_status at 0x1102e6700> with args () {}
+finished <function get_example_status at 0x1102e6700> in 0.0441 second(s)
+starting <function get_example_status at 0x1102e6700> with args () {}
+finished <function get_example_status at 0x1102e6700> in 0.0419 second(s)
+finished <function main at 0x1102e6820> in 0.1702 second(s)
+```
+
+This is again because the requests library is blocking, meaning it will block whichever thread it is run on. Since asyncio only has one thread, the requests library blocks the event loop from doing anything concurrently.
+
+As a rule, most APIs you employ now are blocking and won’t work out of the box with asyncio. You need to use a library that supports coroutines and utilizes nonblocking sockets. This means that if the library you are using does not return coroutines and you aren’t using await in your own coroutines, you’re likely making a blocking call.
+
+In the above example we can use a library such as aiohttp, which uses non-blocking sockets and returns coroutines to get proper concurrency. We’ll introduce this library later in chapter 4.
+
+If you need to use the requests library, you can still use async syntax, but you’ll need to explicitly tell asyncio to use multithreading with a thread pool executor. We’ll see how to do this in chapter 7.
+
+We’ve now seen a few things to look for when using asyncio and have built a few simple applications. So far, we have not created or configured the event loop ourselves but relied on convenience methods to do it for us. Next, we’ll learn to create the event loop, which will allow us to access lower-level asyncio functionality and event loop configuration properties.
+
+## Accessing and manually managing the event loop
+
+Until now, we have used the convenient asyncio.run to run our application and create the event loop for us behind the scenes. Given the ease of use, this is the preferred method to create the event loop. However, there may be cases in which we don’t want the functionality that asyncio.run provides. As an example, we may want to execute custom logic to stop tasks that differ from what asyncio.run does, such as letting any remaining tasks finish instead of stopping them.
+
+In addition, we may want to access methods available on the event loop itself. These methods are typically lower level and, as such, should be used sparingly. However, if you want to perform tasks, such as working directly with sockets or scheduling a task to run at a specific time in the future, you’ll need to access the event loop. While we won’t, and shouldn’t, be managing the event loop extensively, this will be necessary from time to time.
+
+## Creating an event loop manually
+
+We can create an event loop by using the asyncio.new_event_loop method. This will return an event loop instance. With this, we have access to all the low-level methods that the event loop has to offer. With the event loop we have access to a method named run_until_complete, which takes a coroutine and runs it until it finishes. Once we are done with our event loop, we need to close it to free any resources it was using. This should normally be in a finally block so that any exceptions thrown don’t stop us from closing the loop. Using these concepts, we can create a loop and run an asyncio application.
+
+```Python3
+import asyncio
+
+
+async def main():
+  await asyncio.sleep(1)
+
+
+loop = asyncio.new_event_loop()
+
+try:
+  loop.run_until_complete(main())
+finally:
+  loop.close()
+```
+
+The code in this listing is similar to what happens when we call asyncio.run with the difference being that this does not perform canceling any remaining tasks. If we want any special cleanup logic, we would do so in our finally clause.
+
+## Accessing the event loop
+
+From time to time, we may need to access the currently running event loop. asyncio exposes the asyncio.get_running_loop function that allows us to get the current event loop. As an example, let’s look at call_soon, which will schedule a function to run on the next iteration of the event loop.
+
+```Python3
+import asyncio
+from util import delay
+
+
+def call_later():
+  print("I'm being called in the future!")
+
+
+async def main():
+  loop = asyncio.get_running_loop()
+  loop.call_soon(call_later)
+  await delay(1)
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, our main coroutine gets the event loop with asyncio.get _running_loop and tells it to run call_later, which takes a function and will run it on the next iteration of the event loop. In addition, there is an asyncio.get_event _loop function that lets you access the event loop.
+
+This function can potentially create a new event loop if it is called when one is not already running, leading to strange behavior. It is recommended to use get_ running_loop, as this will throw an exception if an event loop isn’t running, avoiding any surprises.
+
+While we shouldn’t use the event loop frequently in our applications, there are times when we will need to configure settings on the event loop or use low-level functions. We’ll see an example of configuring the event loop in the next section on debug mode.
+
+## Using debug mode
+
+In previous sections, we mentioned how coroutines should always be awaited at some point in the application. We also saw the drawbacks of running CPU-bound and other blocking code inside coroutines and tasks. It can, however, be hard to tell if a coroutine is taking too much time on CPU, or if we accidently forgot an await somewhere in our application. Luckily, asyncio gives us a debug mode to help us diagnose these situations.
+
+When we run in debug mode, we’ll see a few helpful log messages when a coroutine or task takes more than 100 milliseconds to run. In addition, if we don’t await a coroutine, an exception is thrown, so we can see where to properly add an await. There are a few different ways to run in debug mode.
+
+### Using ```asyncio.run```
+
+The asyncio.run function we have been using to run coroutines exposes a debug parameter. By default, this is set to False, but we can set this to True to enable debug mode:
+
+```Python3
+asyncio.run(coroutine(), debug=True)
+```
+
+### Using command-line arguments
+
+Debug mode can be enabled by passing a command-line argument when we start our Python application. To do this we apply -X dev:
+
+```bash
+$ python3 -X dev program.py
+```
+
+### Using environment-variablesWe can also use environment variables to enable debug mode by setting the PYTHONASYNCIODEBUG variable to 1:
+
+```bash
+$ PYTHONASYINCIODEBUG=1 python3 program.py
+```
+
+In versions of Python older than 3.9, there is a bug within debug mode. When using asyncio.run, only the boolean debug parameter will work. Command-line arguments and environment variables will only work when manually managing the event loop.
+
+In debug mode, we’ll see informative messages logged when a coroutine takes too long. Let’s test this out by trying to run CPU-bound code in a task to see if we get a warning, as shown in the following listing.
+
+```Python3
+import asyncio
+from util import async_timed
+
+
+@async_timed()
+async def cpu_bound_work() -> int:
+  counter = 0
+  for _ in range(100000000):
+    counter += 1
+
+  return counter
+
+
+async def main() -> None:
+  task_one = asyncio.create_task(cpu_bound_work())
+  await task_one
+
+
+asyncio.run(main(), debug=True)
+```
+
+When running this, we’ll see a helpful message that task_one was taking too long, therefore blocking the event loop from running any other tasks:
+
+```
+Executing <Task finished name='Task-2' coro=<cpu_bound_work() done, defined
+at listing_2_9.py:5> result=100000000 created at tasks.py:382> took 4.829
+seconds
+```
+
+This can be helpful for debugging issues where we may inadvertently be making a call that is blocking. The default settings will log a warning if a coroutine takes longer than 100 milliseconds, but this may be longer or shorter than we’d like. To change this value, we can set the slow callback duration by accessing the event loop as we do in listing 2.24 and setting slow_callback_duration. This is a floating-point value representing the seconds we want the slow callback duration to be.
+
+```Python3
+import asyncio
+
+
+async def main():
+  loop = asyncio.get_event_loop()
+  loop.slow_callback_duration = .250
+
+
+asyncio.run(main(), debug=True)
+```
+
+The preceding listing will set the slow callback duration to 250 milliseconds, meaning we’ll get a message printed out if any coroutine takes longer than 250 milliseconds of CPU time to run
+
