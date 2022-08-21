@@ -1298,3 +1298,98 @@ asyncio.run(main(), debug=True)
 
 The preceding listing will set the slow callback duration to 250 milliseconds, meaning we’ll get a message printed out if any coroutine takes longer than 250 milliseconds of CPU time to run
 
+# 3. A first asyncio application
+
+## An echo server on the asyncio event loop
+
+Working with select is a bit too low-level for most applications. We may want to have code run in the background while we’re waiting for socket data to come in, or we may want to have background tasks run on a schedule. If we were to do this with only selectors, we’d likely build our own event loop, while asyncio has a nicely implemented one ready to use. In addition, coroutines and tasks provide abstractions on top of selectors, which make our code easier to implement and maintain, as we don’t need to think about selectors at all.
+
+Now that we have a deeper understanding on how the asyncio event loop works, let’s take the echo server that we built in the last section and build it again using coroutines and tasks. We’ll still use lower-level sockets to accomplish this, but we’ll use asyncio-based APIs that return coroutines to manage them. We’ll also add some more functionality to our echo server to demonstrate a few key concepts to illustrate how asyncio works.
+
+## Event loop coroutines for sockets
+
+Given that sockets are a relatively low-level concept, the methods for dealing with them are on asyncio’s event loop itself. There are three main coroutines we’ll want to work with: sock_accept, sock_recv and sock_sendall. These are analogous to the socket methods that we used earlier, except that they take in a socket as an argument and return coroutines that we can await until we have data to act on.
+
+Let’s start with sock_accept. This coroutine is analogous to the socket.accept method that we saw in our first implementation. This method will return a tuple (a data structure that stores an ordered sequence of values) of a socket connection and a client address. We pass it in the socket we’re interested in, and we can then await the coroutine it returns. Once that coroutine completes, we’ll have our connection and address. This socket must be non-blocking and should already be bound to a port:
+
+```Python3
+connection, address = await loop.sock_accept(socket)
+```
+
+sock_recv and sock_sendall are called similarly to sock_accept. They take in a socket, and we can then await for a result. sock_recv will await until a socket has bytes we can process. sock_sendall takes in both a socket and data we want to send and will wait until all data we want to send to a socket has been sent and will return None on success:
+
+```Python3
+data = await loop.sock_recv(socket)
+success = await loop.sock_sendall(socket, data)
+```
+
+With these building blocks, we’ll be able to translate our previous approaches into one using coroutines and tasks.
+
+## Designing an asyncio echo server
+
+In chapter 2, we introduced coroutines and tasks. So when should we use just a coroutine, and when should we wrap a coroutine in a task for our echo server? Let’s examine how we want our application to behave to make this determination.
+
+We’ll start with how we want to listen for connections in our application. When we are listening for connections, we will only be able to process one connection at a time as socket.accept will only give us one client connection. Behind the scenes, incoming connections will be stored in a queue known as the backlog if we get multiple connections at the same time, but here, we won’t get into how this works.
+
+Since we don’t need to process multiple connections concurrently, a single coroutine that loops forever makes sense. This will allow other code to run concurrently while we’re paused waiting for a connection. We’ll define a coroutine called listen_ for_connections that will loop forever and listen for any incoming connections:
+
+```Python3
+async def listen_for_connections(server_socket: socket, loop: AbstractEventLoop):
+    while True:
+        connection, address = await loop.sock_accept(server_socket)
+        connection.setblocking(False)
+        print(f"Got a connection from {address}")
+```
+
+Now that we have a coroutine for listening to connections, how about reading and writing data to the clients who have connected? Should that be a coroutine, or a coroutine we wrap in a task? In this case, we will have multiple connections, each of which could send data to us at any time. We don’t want to wait for data from one connection to block another, so we need to read and write data from multiple clients concurrently. Because we need to handle multiple connections at the same time, creating a task for each connection to read and write data makes sense. On every connection we get, we’ll create a task to both read data from and write data to that connection.
+
+We’ll create a coroutine named echo that is responsible for handling data from a connection. This coroutine will loop forever listening for data from our client. Once it receives data it will then send it back to the client.
+
+Then, in listen_for_connections we’ll create a new task that wraps our echo coroutine for each connection that we get. With these two coroutines defined, we now have all we need to build an asyncio echo server.
+
+```Python3
+import asyncio
+import socket
+from asyncio import AbstractEventLoop
+
+
+async def echo(connection: socket, loop: AbstractEventLoop) -> None:
+    # Loop forever waiting for data from a client connection
+    while data := await loop.sock_recv(connection, 1024):
+        # Once we have data, send it back to ALL clients.
+        await loop.sock_sendall(connection, data)
+
+
+async def listen_for_connection(server_socket: socket, loop: AbstractEventLoop) -> None:
+    while True:
+        connection, address = await loop.sock_accept(server_socket)
+        connection.setblocking(False)
+        print(f'Got a connection from {address}')
+
+        # Whenever we get a connection, create an echo task to listen for client data.
+        asyncio.create_task(echo(connection, loop))
+
+
+async def main():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    server_address = ('127.0.0.1', 8000)
+    server_socket.setblocking(False)
+    server_socket.bind(server_address)
+    server_socket.listen()
+
+    # Start the coroutine to listen for connections
+    await listen_for_connection(server_socket, asyncio.get_event_loop())
+
+
+asyncio.run(main())
+```
+
+The architecture for the preceding listing looks like figure 3.5. We have one coroutine, listen_for_connection, listening for connections. Once a client connects, our coroutine spawns an echo task for each client which then listens for data and writes it back out to the client.
+
+![Figure-3-5](ScreenshotsForNotes/Chapter3/Figure_3_5.PNG)
+
+When we run this application, we’ll be able to connect multiple clients concurrently and send data to them concurrently. Under the hood, this is all using selectors as we saw before, so our CPU utilization remains low.
+
+We’ve now built a fully functioning echo server entirely using asyncio! So is our implementation error free? It turns out that the way we have designed this echo server does have an issue when our echo task fails that we’ll need to handle
