@@ -1393,3 +1393,978 @@ The architecture for the preceding listing looks like figure 3.5. We have one co
 When we run this application, we’ll be able to connect multiple clients concurrently and send data to them concurrently. Under the hood, this is all using selectors as we saw before, so our CPU utilization remains low.
 
 We’ve now built a fully functioning echo server entirely using asyncio! So is our implementation error free? It turns out that the way we have designed this echo server does have an issue when our echo task fails that we’ll need to handle
+
+# 4. Concurrent web requests
+
+## Asynchronous context managers
+
+In any programming language, dealing with resources that must be opened and then closed, such as files, is common. When dealing with these resources, we need to be careful about any exceptions that may be thrown. This is because if we open a resource and an exception is thrown, we may never execute any code to clean up, leaving us in a status with leaking resources. Dealing with this in Python is straightforward using a ```finally``` block. Though this example is not exactly Pythonic, we can always close a file even if an exception was thrown:
+
+```Python3
+file = open('example.txt')
+
+try:
+    lines = file.readlines()
+finally:
+    file.close()
+```
+
+This solves the issue of a file handle being left open if there was an exception during file.readlines. The drawback is that we must remember to wrap everything in a try finally, and we also need to remember the methods to call to properly close our resource. This isn’t too hard to do for files, as we just need to remember to close them, but we’d still like something more reusable, especially since our cleanup may be more complicated than just calling one method. Python has a language feature to deal with this known as a context manager. Using this, we can abstract the shutdown logic along with the try/finally block:
+
+```Python3
+with open(‘example.txt’) as file:
+    lines = file.readlines()
+```
+
+This Pythonic way to manage files is a lot cleaner. If an exception is thrown in the with block, our file will automatically be closed. This works for synchronous resources, but what if we want to asynchronously use a resource with this syntax? In this case, the context manager syntax won’t work, as it is designed to work only with synchronous Python code and not coroutines and tasks. Python introduced a new language feature to support this use case, called asynchronous context managers. The syntax is almost the same as for synchronous context managers with the difference being that we say async with instead of just with.
+
+Asynchronous context managers are classes that implement two special coroutine methods, __aenter__, which asynchronously acquires a resource and __aexit__, which closes that resource. The __aexit__ coroutine takes several arguments that deal with any exceptions that occur, which we won’t review in this chapter.
+
+To fully understand async context managers, let’s implement a simple one using the sockets we introduced in chapter 3. We can consider a client socket connection a resource we’d like to manage. When a client connects, we acquire a client connection. Once we are done with it, we clean up and close the connection. In chapter 3, we wrapped everything in a try/finally block, but we could have implemented an asynchronous context manager to do so instead.
+
+```Python3
+
+import asyncio
+import socket
+from types import TracebackType
+from typing import Optional, Type
+
+
+class ConnectedSocket:
+  def __init__(self, server_socket):
+    self._connection = None
+    self._server_socket = server_socket
+
+  async def __aenter__(self):
+    print('Entering context manager, waiting for connection')
+    loop = asyncio.get_event_loop()
+    connection, address = await loop.sock_accept(self._server_socket)
+    self._connection = connection
+    print('Accepted a connection')
+    return self._connection
+
+  async def __aexit__(self,
+                      exc_type: Optional[Type[BaseException]],
+                      exc_val: Optional[BaseException],
+                      exc_tb: Optional[TracebackType]) -> None:
+    print('Exiting context manager')
+    self._connection.close()
+    print('Closed connection')
+
+
+async def main():
+  loop = asyncio.get_event_loop()
+
+  server_socket = socket.socket()
+  server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  server_address = ('127.0.0.1', 8000)
+  server_socket.setblocking(False)
+  server_socket.bind(server_address)
+  server_socket.listen()
+
+  async with ConnectedSocket(server_socket) as connection:
+    data = await loop.sock_recv(connection, 1024)
+    print(data)
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we created a ConnectedSocket async context manager. This class takes in a server socket, and in our __aenter__ coroutine we wait for a client to connect. Once a client connects, we return that client’s connection. This lets us access that connection in the as portion of our async with statement. Then, inside our async with block, we use that connection to wait for the client to send us data. Once this block finishes execution, the __aexit__ coroutine runs and closes the connection. Assuming a client connects with Telnet and sends some test data, we should see output like the following when running this program:
+
+```
+Entering context manager, waiting for connection
+Accepted a connection
+b'test\r\n'
+Exiting context manager
+Closed connection
+```
+
+## Making a web request with aiohttp
+
+aiohttp, and web requests in general, employ the concept of a session. Think of a session as opening a new browser window. Within a new browser window, you’ll make connections to any number of web pages, which may send you cookies that your browser saves for you. With a session, you’ll keep many connections open, which can then be recycled. This is known as connection pooling. Connection pooling is an important concept that aids the performance of our aiohttp-based applications. Since creating connections is resource intensive, creating a reusable pool of them cuts down on resource allocation costs. A session will also internally save any cookies that we receive, although this functionality can be turned off if desired.
+
+Typically, we want to take advantage of connection pooling, so most aiohttpbased applications run one session for the entire application. This session object is then passed to methods where needed. A session object has methods on it for making any number of web requests, such as GET, PUT, and POST. We can create a session by using async with syntax and the aiohttp.ClientSession asynchronous context manager.
+
+```Python3
+import asyncio
+import aiohttp
+
+from aiohttp import ClientSession
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  async with session.get(url) as result:
+    return result.status
+
+
+async def main():
+  async with aiohttp.ClientSession() as session:
+    url = 'https://www.example.com'
+    status = await fetch_status(session, url)
+    print(f'Status for {url} was {status}')
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+When we run this, we should see that the output Status for http:/ / www .example .com was 200. In the preceding listing, we first created a client session in an async with block with aiohttp.ClientSession(). Once we have a client session, we’re free to make any web request desired. In this case, we define a convenience method fetch_status_code that will take in a session and a URL and return the status code for the given URL. In this function, we have another async with block and use the session to run a GET HTTP request against the URL. This will give us a result, which we can then process within the with block. In this case, we just grab the status code and return.
+
+Note that a ClientSession will create a default maximum of 100 connections by default, providing an implicit upper limit to the number of concurrent requests we can make. To change this limit, we can create an instance of an aiohttp TCPConnector specifying the maximum number of connections and passing that to the Client- Session. To learn more about this, review the aiohttp documentation at https:// docs.aiohttp.org/en/stable/client_advanced.html#connectors.
+
+## Setting timeouts with aiohttp
+
+Earlier we saw how we could specify a timeout for an awaitable by using asyncio.wait_ for. This will also work for setting timeouts for an aiohttp request, but a cleaner way to set timeouts is to use the functionality that aiohttp provides out of the box.
+
+By default, aiohttp has a timeout of five minutes, which means that no single operation should take longer than that. This is a long timeout, and many application developers may wish to set this lower. We can specify a timeout at either the session level, which will apply that timeout for every operation, or at the request level, which provides more granular control.
+
+We can specify timeouts using the aiohttp-specific ClientTimeout data structure. This structure not only allows us to specify a total timeout in seconds for an entire request but also allows us to set timeouts on establishing a connection or reading data. Let’s examine how to use this by specifying a timeout for our session and one for an individual request.
+
+```Python3
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=.01)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+async def main():
+  session_timeout = aiohttp.ClientTimeout(total=1, connect=.1)
+
+  async with aiohttp.ClientSession(timeout=session_timeout) as session:
+    await fetch_status(session, 'https://www.example.com')
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+In the preceding listing, we set two timeouts. The first timeout is at the client-session level. Here we set a total timeout of 1 second and explicitly set a connection timeout of 100 milliseconds. Then, in fetch_status we override this for our get request to set a total timeout of 10 miliseconds. In this instance, if our request to example.com takes more than 10 milliseconds, an asyncio.TimeoutError will be raised when we await fetch_status. In this example, 10 milliseconds should be enough time for the request to example.com to complete, so we’re not likely to see an exception. If you’d like to check out this exception, change the URL to a page that takes a bit longer than 10 milliseconds to download.
+
+## Running tasks concurrently, revisited
+
+In the first few chapters of this book, we learned how to create multiple tasks to run coroutines concurrently. To do this, we used asyncio.create_task and then awaited the task as below:
+
+```Python3
+import asyncio
+
+async def main() -> None:
+    task_one = asyncio.create_task(delay(1))
+    task_two = asyncio.create_task(delay(2))
+    
+await task_one
+await task_two
+```
+
+This works for simple cases like the previous one in which we have one or two coroutines we want to launch concurrently. However, in a world where we may make hundreds, thousands, or even more web requests concurrently, this style would become verbose and messy.
+
+We may be tempted to utilize a for loop or a list comprehension to make this a little smoother, as demonstrated in the following listing. However, this approach can cause issues if not written correctly.
+
+```Python3
+import asyncio
+from util import async_timed, delay
+
+
+@async_timed()
+async def main() -> None:
+    delay_times = [3, 3, 3]
+    [await asyncio.create_task(delay(seconds)) for seconds in delay_times]
+
+asyncio.run(main())
+```
+
+Given that we ideally want the delay tasks to run concurrently, we’d expect the main method to complete in about 3 seconds. However, in this case 9 seconds elapse to run, since everything is done sequentially:
+
+```
+starting <function main at 0x10f14a550> with args () {}
+starting <function delay at 0x10f7684c0> with args (3,) {}
+sleeping for 3 second(s)
+finished sleeping for 3 second(s)
+finished <function delay at 0x10f7684c0> in 3.0008 second(s)
+starting <function delay at 0x10f7684c0> with args (3,) {}
+sleeping for 3 second(s)
+finished sleeping for 3 second(s)
+finished <function delay at 0x10f7684c0> in 3.0009 second(s)
+starting <function delay at 0x10f7684c0> with args (3,) {}
+sleeping for 3 second(s)
+finished sleeping for 3 second(s)
+finished <function delay at 0x10f7684c0> in 3.0020 second(s)
+finished <function main at 0x10f14a550> in 9.0044 second(s)
+```
+
+The problem here is subtle. It occurs because we use await as soon as we create the task. This means that we pause the list comprehension and the main coroutine for every delay task we create until that delay task completes. In this case, we will have only one task running at any given time, instead of running multiple tasks concurrently. The fix is easy, although a bit verbose. We can create the tasks in one list comprehension and await in a second. This lets everything run concurrently.
+
+```Python3
+import asyncio
+from util import async_timed, delay
+
+
+@async_timed()
+async def main() -> None:
+    delay_times = [3, 3, 3]
+    print("hello 1")
+    tasks = [asyncio.create_task(delay(seconds)) for seconds in delay_times]
+    print("hello 2")
+    [await task for task in tasks]
+    print("hello 3")
+
+
+asyncio.run(main())
+```
+
+This code creates a number of tasks all at once in the tasks list. Once we have created all the tasks, we await their completion in a separate list comprehension. This works because create_task returns instantly, and we don’t do any awaiting until all the tasks have been created. This ensures that it only requires at most the maximum pause in delay_times, giving a runtime of about 3 seconds:
+
+```
+starting <function main at 0x10d4e1550> with args () {}
+starting <function delay at 0x10daff4c0> with args (3,) {}
+sleeping for 3 second(s)
+starting <function delay at 0x10daff4c0> with args (3,) {}
+sleeping for 3 second(s)
+starting <function delay at 0x10daff4c0> with args (3,) {}
+sleeping for 3 second(s)
+finished sleeping for 3 second(s)
+finished <function delay at 0x10daff4c0> in 3.0029 second(s)
+finished sleeping for 3 second(s)
+finished <function delay at 0x10daff4c0> in 3.0029 second(s)
+finished sleeping for 3 second(s)
+finished <function delay at 0x10daff4c0> in 3.0029 second(s)
+finished <function main at 0x10d4e1550> in 3.0031 second(s)
+```
+
+While this does what we want, drawbacks remain. The first is that this consists of multiple lines of code, where we must explicitly remember to separate out our task creation from our awaits. The second is that it is inflexible, and if one of our coroutines finishes long before the others, we’ll be trapped in the second list comprehension waiting for all other coroutines to finish. While this may be acceptable in certain circumstances, we may want to be more responsive, processing our results as soon as they arrive. The third, and potentially biggest issue, is exception handling. If one of our coroutines has an exception, it will be thrown when we await the failed task. This means that we won’t be able to process any tasks that completed successfully because that one exception will halt our execution.
+
+asyncio has convenience functions to deal with all these situations and more. These functions are recommended when running multiple tasks concurrently. In the following sections, we’ll look at some of them, and examine how to use them in the context of making multiple web requests concurrently.
+
+## Running requests concurrently with gather
+
+A widely used asyncio API functions for running awaitables concurrently is asyncio .gather. This function takes in a sequence of awaitables and lets us run them concurrently, all in one line of code. If any of the awaitables we pass in is a coroutine, gather will automatically wrap it in a task to ensure that it runs concurrently. This means that we don’t have to wrap everything with asyncio.create_task separately as we used above.
+
+asyncio.gather returns an awaitable. When we use it in an await expression, it will pause until all awaitables that we passed into it are complete. Once everything we passed in finishes, asyncio.gather will return a list of the completed results.
+
+We can use this function to run as many web requests as we’d like concurrently. To illustrate this, let’s see an example where we make 1,000 requests at the same time and grab the status code of each response. We’ll decorate our main coroutine with @async_ timed so we know how long things are taking.
+
+```Python3
+import asyncio
+import aiohttp
+
+from aiohttp import ClientSession
+from util import async_timed
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    urls = ['https://www.example.com' for _ in range(100)]
+
+    # Generate a list of coroutines for each request we want to make.
+    requests = [fetch_status(session, url) for url in urls]
+
+    # Wait for all requests to complete.
+    status_codes = await asyncio.gather(*requests)
+
+    print(status_codes)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+In the preceding listing, we first generate a list of URLs we’d like to retrieve the status code from; for simplicity, we’ll request example.com repeatedly. We then take that list of URLs and call fetch_status_code to generate a list of coroutines that we then pass into gather. This will wrap each coroutine in a task and start running them concurrently. When we execute this code, we’ll see 1,000 messages printed to standard out, saying that the fetch_status_code coroutines started sequentially, indicating that 1,000 requests started concurrently. As results come in, we’ll see messages like finished <function fetch_status_code at 0x10f3fe3a0> in 0.5453 second(s) arrive. Once we retrieve the contents of all the URLs we’ve requested, we’ll see the status codes start to print out. This process is quick, depending on the internet connection and speed of the machine, and this script can finish in as little as 500–600 milliseconds.
+
+So how does this compare with doing things synchronously? It’s easy to adapt the main function so that it blocks on each request by using an await when we call fetch_status_code. This will pause the main coroutine for each URL, effectively making things synchronous:
+
+```Python3
+@async_timed()
+async def main():
+    async with aiohttp.ClientSession() as session:
+        urls = ['https:/ / example .com' for _ in range(1000)]
+        status_codes = [await fetch_status_code(session, url) for url in
+        urls]
+        print(status_codes)
+```
+
+If we run this, notice that things will take much longer. We’ll also notice that, instead of getting 1,000 starting function fetch_status_code messages followed by 1,000 finished function fetch_status_code messages, something like the following displays for each request:
+
+```
+starting <function fetch_status_code at 0x10d95b310>
+finished <function fetch_status_code at 0x10d95b310> in 0.01884 second(s)
+```
+
+This indicates that requests occur one after another, waiting for each call to fetch_ status_code to finish before moving on to the next request. So how much slower is this than using our async version? While this depends on your internet connection and the machine you run this on, running sequentially can take around 18 seconds to complete. Comparing this with our asynchronous version, which took around 600 milliseconds, the latter runs an impressive 33 times faster.
+
+It is worth noting that the results for each awaitable we pass in may not complete in a deterministic order. For example, if we pass coroutines a and b to gather in that order, b may complete before a. A nice feature of gather is that, regardless of when our awaitables complete, we are guaranteed the results will be returned in the order we passed them in. Let’s demonstrate this by looking at the scenario we just described with our delay function.
+
+```Python3
+import asyncio
+from util import delay, async_timed
+
+
+@async_timed()
+async def main():
+  results = await asyncio.gather(delay(3), delay(1))
+  print(results)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+In the preceding listing, we pass two coroutines to gather. The first takes 3 seconds to complete and the second takes 1 second. We may expect the result of this to be [1, 3], since our 1-second coroutine finishes before our 3-second coroutine, but the result is actually [3, 1]—the order we passed things in. The gather function keeps result ordering deterministic despite the inherent nondeterminism behind the scenes. In the background, gather uses a special kind of future implementation to do this. For the curious reader, reviewing the source code of gather can be an instructive way to understand how many asyncio APIs are built using futures.
+
+## Handling exceptions with gather
+
+Of course, when we make a web request, we might not always get a value back; we might get an exception. Since networks can be unreliable, different failure cases are possible. For example, we could pass in an address that is invalid or has become invalid because the site has been taken down. The server we connect to could also close or refuse our connection.
+
+```asyncio.gather``` gives us an optional parameter, return_exceptions, which allows us to specify how we want to deal with exceptions from our awaitables. return_exceptions is a Boolean value; therefore, it has two behaviors that we can choose from:
+
+* ```return_exceptions=False``` —This is the default value for gather. In this case, if any of our coroutines throws an exception, our gather call will also throw that exception when we await it. However, even though one of our coroutines failed, our other coroutines are not canceled and will continue to run as long as we handle the exception, or the exception does not result in the event loop stopping and canceling the tasks.
+* ```return_exceptions=True``` —In this case, gather will return any exceptions as part of the result list it returns when we await it. The call to gather will not throw any exceptions itself, and we’ll be able handle all exceptions as we wish.
+
+To illustrate how these options work, let’s change our URL list to contain an invalid web address. This will cause aiohttp to raise an exception when we attempt to make the request. We’ll then pass that into gather and see how each of these return_ exceptions behaves:
+
+```Python3
+@async_timed()
+async def main():
+    async with aiohttp.ClientSession() as session:
+        urls = ['https:/ / example .com', 'python:/ / example .com']
+        tasks = [fetch_status_code(session, url) for url in urls]
+        status_codes = await asyncio.gather(*tasks)
+        print(status_codes)
+```
+
+If we change our URL list to the above, the request for 'python:/ / example .com' will fail because that URL is not valid. Our fetch_status_code coroutine will throw an AssertionError because of this, meaning that python:/ / does not translate into a port. This exception will get thrown when we await our gather coroutine. If we run this and look at the output, we’ll see that our exception was thrown, but we’ll also see that our other request continued to run (we’ve removed the verbose traceback for brevity):
+
+```
+starting <function main at 0x107f4a4c0> with args () {}
+starting <function fetch_status_code at 0x107f4a3a0>
+starting <function fetch_status_code at 0x107f4a3a0>
+finished <function fetch_status_code at 0x107f4a3a0> in 0.0004 second(s)
+finished <function main at 0x107f4a4c0> in 0.0203 second(s)
+finished <function fetch_status_code at 0x107f4a3a0> in 0.0198 second(s)
+Traceback (most recent call last):
+    File "gather_exception.py", line 22, in <module>
+      asyncio.run(main())
+AssertionError
+
+Process finished with exit code 1
+```
+
+asyncio.gather won’t cancel any other tasks that are running if there is a failure. That may be acceptable for many use cases but is one of the drawbacks of gather. We’ll see how to cancel tasks we run concurrently later in this chapter.
+
+Another potential issue with the above code is that if more than one exception happens, we’ll only see the first one that occurred when we await the gather. We can fix this by using return_exceptions=True, which will return all exceptions we encounter when running our coroutines. We can then filter out any exceptions and handle them as needed. Let’s examine our previous example with invalid URLs to understand how this works:
+
+```Python3
+@async_timed()
+async def main():
+    async with aiohttp.ClientSession() as session:
+        urls = ['https:/ / example .com', 'python:/ / example .com']
+        
+        tasks = [fetch_status_code(session, url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        exceptions = [res for res in results if isinstance(res, Exception)]
+        successful_results = [res for res in results if not isinstance(res,
+        Exception)]
+        
+        print(f'All results: {results}')
+        print(f'Finished successfully: {successful_results}')
+        print(f'Threw exceptions: {exceptions}')
+```
+
+When running this, notice that no exceptions are thrown, and we get all the exceptions alongside our successful results in the list that gather returns. We then filter out anything that is an instance of an exception to retrieve the list of successful responses, resulting in the following output:
+
+```
+All results: [200, AssertionError()]
+Finished successfully: [200]
+Threw exceptions: [AssertionError()]
+```
+
+This solves the issue of not being able to see all the exceptions that our coroutines throw. It is also nice that now we don’t need to explicitly handle any exceptions with a try catch block, since we no longer throw an exception when we await. It is still a little clunky that we must filter out exceptions from successful results, but the API is not perfect.
+
+```gather``` has a few drawbacks. The first, which was already mentioned, is that it isn’t easy to cancel our tasks if one throws an exception. Imagine a case in which we’re making requests to the same server, and if one request fails, all others will as well, such as reaching a rate limit. In this case, we may want to cancel requests to free up resources, which isn’t very easy to do because our coroutines are wrapped in tasks in the background.
+
+The second is that we must wait for all our coroutines to finish before we can process our results. If we want to deal with results as soon as they complete, this poses a problem. For example, if we have one request needing 100 milliseconds, but another that lasts 20 seconds, we’ll be stuck waiting for 20 seconds before we can process the request that completed in only 100 milliseconds.
+
+asyncio provides APIs that allow us to solve for both issues. Let’s start by looking at the problem of handling results as soon as they come in.
+
+## Processing requests as they complete
+
+While asyncio.gather will work for many cases, it has the drawback that it waits for all awaitables to finish before allowing access to any results. This is a problem if we’d like to process results as soon as they come in. It can also be a problem if we have a fewawaitables that could complete quickly and a few which could take some time, since gather waits for everything to finish. This can cause our application to become unresponsive; imagine a user makes 100 requests and two of them are slow, but the rest complete quickly. It would be great if once requests start to finish, we could output some information to our users.
+
+To handle this case, asyncio exposes an API function named as_completed. This method takes a list of awaitables and returns an iterator of futures. We can then iterate over these futures, awaiting each one. When the await expression completes, we will retrieve the result of the coroutine that finished first out of all our awaitables. This means that we’ll be able to process results as soon as they are available, but there is now no deterministic ordering of results, since we have no guarantees as to which requests will complete first.
+
+To show how this works, let’s simulate a case where one request completes quickly, and another needs more time. We’ll add a delay parameter to our fetch_status function and call asyncio.sleep to simulate a long request, as follows:
+
+```Python3
+async def fetch_status(session: ClientSession,
+                      url: str,
+                      delay: int = 0) -> int:
+    await asyncio.sleep(delay)
+    async with session.get(url) as result:
+        return result.status
+```
+
+We’ll then use a for loop to iterate over the iterator returned from as_completed.
+
+```Python3
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
+from util import async_timed
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    url = 'https://www.example.com'
+
+    fetchers = [
+      fetch_status(session, url),
+      fetch_status(session, url),
+      fetch_status(session, url),
+    ]
+
+    for finished_task in asyncio.as_completed(fetchers):
+      print(await finished_task)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+In the preceding listing, we create three coroutines—two that require about 1 second to complete and one that will take 10 seconds. We then pass these into as_completed
+
+Under the hood, each coroutine is wrapped in a task and starts running concurrently. The routine instantly returned an iterator that starts to loop over. When we enter the for loop, we hit await finished_task. Here we pause execution and wait for our first result to come in. In this case, our first result comes in after 1 second, and we print the status code. Then we reach the await result again, and since our requests ran concurrently, we should see the second result almost instantly. Finally, our 10-second request will complete, and our loop will finish. Executing this will give us output as follows:
+
+```
+starting <function fetch_status at 0x10dbed4c0>
+starting <function fetch_status at 0x10dbed4c0>
+starting <function fetch_status at 0x10dbed4c0>
+finished <function fetch_status at 0x10dbed4c0> in 1.1269 second(s)
+200
+finished <function fetch_status at 0x10dbed4c0> in 1.1294 second(s)
+200
+finished <function fetch_status at 0x10dbed4c0> in 10.0345 second(s)
+200
+finished <function main at 0x10dbed5e0> in 10.0353 second(s)
+```
+
+In total, iterating over result_iterator still takes about 10 seconds, as it would have if we used asynio.gather; however, we’re able to execute code to print the result of our first request as soon as it finishes. This gives us extra time to process the result of our first successfully finished coroutine while others are still waiting to finish, making our application more responsive when our tasks complete.
+
+This function also offers better control over exception handling. When a task throws an exception, we’ll be able to process it when it happens, as the exception is thrown when we await the future.
+
+## Timeouts with as_completed
+
+Any web-based request runs the risk of taking a long time. A server could be under a heavy resource load, or we could have a poor network connection. Earlier, we saw how to add timeouts for a particular request, but what if we wanted to have a timeout for a group of requests? The as_completed function supports this use case by supplying an optional timeout parameter, which lets us specify a timeout in seconds. This will keep track of how long the as_completed call has taken; if it takes longer than the timeout, each awaitable in the iterator will throw a TimeoutException when we await it.
+
+To illustrate this, let’s take our previous example and create two requests that take 10 seconds to complete and one request that takes 1 second. Then, we’ll set a timeout of 2 seconds on as_completed. Once we’re done with the loop, we’ll print out all the tasks we have that are currently running.
+
+```Python3
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
+from util import async_timed
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    url = 'https://www.example.com'
+
+    fetchers = [
+      fetch_status(session, url),
+      fetch_status(session, url),
+      fetch_status(session, url),
+    ]
+
+    for done_task in asyncio.as_completed(fetchers):
+      try:
+        result = await done_task
+        print(result)
+      except asyncio.TimeoutError:
+        print('We got a timeout error!')
+
+    for task in asyncio.tasks.all_tasks():
+      print(task)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+When we run this, we’ll notice the result from our first fetch, and after 2 seconds, we’ll see two timeout errors. We’ll also see that two fetches are still running, giving output similar to the following:
+
+```
+starting <function main at 0x109c7c430> with args () {}
+200
+We got a timeout error!
+We got a timeout error!
+finished <function main at 0x109c7c430> in 2.0055 second(s)
+<Task pending name='Task-2' coro=<fetch_status_code()>>
+<Task pending name='Task-1' coro=<main>>
+<Task pending name='Task-4' coro=<fetch_status_code()>>
+```
+
+as_completed works well for getting results as fast as possible but has drawbacks. The first is that while we get results as they come in, there isn’t any way to easily see which coroutine or task we’re awaiting as the order is completely nondeterministic. If we don’t care about order, this may be fine, but if we need to associate the results to the requests somehow, we’re left with a challenge.
+
+The second is that with timeouts, while we will correctly throw an exception and move on, any tasks created will still be running in the background. Since it’s hard to figure out which tasks are still running if we want to cancel them, we have another challenge. If these are problems we need to deal with, then we’ll need some finergrained knowledge of which awaitables are finished, and which are not. To handle this situation, asyncio provides another API function called wait.
+
+## Finer-grained control with wait
+
+One of the drawbacks of both gather and as_completed is that there is no easy way to cancel tasks that were already running when we saw an exception. This might be okay in many situations, but imagine a use case in which we make several coroutine calls and if the first one fails, the rest will as well. An example of this would be passing in an invalid parameter to a web request or reaching an API rate limit. This has the potential to cause performance issues because we’ll consume more resources by having more tasks than we need. Another drawback we noted with as_completed is that, as the iteration order is nondeterministic, it is challenging to keep track of exactly which task had completed.
+
+wait in asyncio is similar to gather wait that offers more specific control to handle these situations. This method has several options to choose from depending on when we want our results. In addition, this method returns two sets: a set of tasks that are finished with either a result or an exception, and a set of tasks that are still running. This function also allows us to specify a timeout that behaves differently from how other API methods operate; it does not throw exceptions. When needed, this function can solve some of the issues we noted with the other asyncio API functions we’ve used so far.
+
+The basic signature of wait is a list of awaitable objects, followed by an optional timeout and an optional return_when string. This string has a few predefined values that we’ll examine: ALL_COMPLETED, FIRST_EXCEPTION and FIRST_COMPLETED. It defaults to ALL_COMPLETED. While as of this writing, wait takes a list of awaitables, it will change in future versions of Python to only accept task objects. We’ll see why at the end of this section, but for these code samples, as this is best practice, we’ll wrap all coroutines in tasks.
+
+## Waiting for all tasks to complete
+
+This option is the default behavior if return_when is not specified, and it is the closest in behavior to asyncio.gather, though it has a few differences. As implied, using this option will wait for all tasks to finish before returning. Let’s adapt this to our example of making multiple web requests concurrently to learn how this function works.
+
+```Python3
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
+from util import async_timed
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    url = 'https://www.example.com'
+
+    fetchers = [
+      asyncio.create_task(fetch_status(session, url)),
+      asyncio.create_task(fetch_status(session, url))
+    ]
+
+    done, pending = await asyncio.wait(fetchers)
+
+    print(f'Done task count: {len(done)}')
+    print(f'Pending task count: {len(pending)}')
+
+    for done_task in done:
+      result = await done_task
+      print(result)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+In the preceding listing, we run two web requests concurrently by passing a list of coroutines to wait. When we await wait it will return two sets once all requests finish: one set of all tasks that are complete and one set of the tasks that are still running. The done set contains all tasks that finished either successfully or with exceptions. The pending set contains all tasks that have not finished yet. In this instance, since we are using the ALL_COMPLETED option the pending set will always be zero, since asyncio.wait won’t return until everything is completed. This will give us the following output:
+
+```
+starting <function main at 0x10124b160> with args () {}
+Done task count: 2
+Pending task count: 0
+200
+200
+finished <function main at 0x10124b160> in 0.4642 second(s)
+```
+
+If one of our requests throws an exception, it won’t be thrown at the asyncio.wait call in the same way that asyncio.gather did. In this instance, we’ll get both the done and pending sets as before, but we won’t see an exception until we await the task in done that failed.
+
+With this paradigm, we have a few options on how to handle exceptions. We can use await and let the exception throw, we can use await and wrap it in a try except block to handle the exception, or we can use the task.result() and task.exception() methods. We can safely call these methods since our tasks in the done set are guaranteed to be completed tasks; if they were not calling these methods, it would then produce an exception.
+
+Let’s say that we don’t want to throw an exception and have our application crash. Instead, we’d like to print the task’s result if we have it and log an error if there was an exception. In this case, using the methods on the Task object is an appropriate solution. Let’s see how to use these two Task methods to handle exceptions.
+
+```Python3
+import asyncio
+import aiohttp
+import logging
+from util import async_timed
+from aiohttp import ClientSession
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    good_request = fetch_status(session, 'https://www.example.com')
+    bad_request = fetch_status(session, 'python://bad')
+
+    fetchers = [
+      asyncio.create_task(good_request),
+      asyncio.create_task(bad_request)
+    ]
+
+    done, pending = await asyncio.wait(fetchers)
+
+    print(f'Done task count: {len(done)}')
+    print(f'Pending task count: {len(pending)}')
+
+    for done_task in done:
+      if done_task.exception() is None:
+        print(done_task.result())
+      else:
+        logging.error("Request got an exception", exc_info=done_task.exception())
+```
+
+Using done_task.exception() will check to see if we have an exception. If we don’t, then we can proceed to get the result from done_task with the result method. It would also be safe to do result = await done_task here, although it might throw an exception, which may not be what we want. If the exception is not None, then we know that the awaitable had an exception, and we can handle that as desired. Here we just print out the exception’s stack trace. Running this will yield output similar to the following (we’ve removed the verbose traceback for brevity):
+
+```
+starting <function main at 0x10401f1f0> with args () {}
+Done task count: 2
+Pending task count: 0
+200
+finished <function main at 0x10401f1f0> in 0.12386679649353027 second(s)
+ERROR:root:Request got an exception
+Traceback (most recent call last):
+AssertionError
+```
+
+## Watching for exceptions
+
+The drawbacks of ALL_COMPLETED are like the drawbacks we saw with gather. We could have any number of exceptions while we wait for other coroutines to complete, which we won’t see until all tasks complete. This could be an issue if, because of one exception, we’d like to cancel other running requests. We may also want toimmediately handle any errors to ensure responsiveness and continue waiting for other coroutines to complete.
+
+To support these use cases, wait supports the FIRST_EXCEPTION option. When we use this option, we’ll get two different behaviors, depending on whether any of our tasks throw exceptions.
+
+> No exceptions from any awaitables: If we have no exceptions from any of our tasks, then this option is equivalent to ALL_COMPLETED. We’ll wait for all tasks to finish and then the done set will contain all finished tasks and the pending set will be empty.
+> One or more exception from a task: If any task throws an exception, wait will immediately return once that exception is thrown. The done set will have any coroutines that finished successfully alongside any coroutines with exceptions. The done set is, at minimum, guaranteed to have one failed task in this case but may have successfully completed tasks. The pending set may be empty, but it may also have tasks that are still running. We can then use this pending set to manage the currently running tasks as we desire.
+
+To illustrate how wait behaves in these scenarios, look at what happens when we have a couple of long-running web requests we’d like to cancel when one coroutine fails immediately with an exception.
+
+```Python3
+import aiohttp
+import asyncio
+import logging
+
+from aiohttp import ClientSession
+from util import async_timed
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    fetchers = [
+      asyncio.create_task(fetch_status(session, 'python://bad.com')),
+      asyncio.create_task(fetch_status(session, 'https://www.example.com')),
+      asyncio.create_task(fetch_status(session, 'https://www.example.com')),
+    ]
+
+    done, pending = await asyncio.wait(fetchers, return_when=asyncio.FIRST_EXCEPTION)
+
+    print(f'Done task count: {len(done)}')
+    print(f'Pending task count: {len(pending)}')
+
+    for done_task in done:
+      if done_task.exception() is None:
+        print(done_task.result())
+      else:
+        logging.error("Request got an exception", exc_info=done_task.exception())
+
+    for pending_task in pending:
+      pending_task.cancel()
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+In the preceding listing, we make one bad request and two good ones; each lasts 3 seconds. When we await our wait statement, we return almost immediately since our bad request errors out right away. Then we loop through the done tasks. In this instance, we’ll have only one in the done set since our first request ended immediately with an exception. For this, we’ll execute the branch that prints the exception.
+
+The pending set will have two elements, as we have two requests that take roughly 3 seconds each to run and our first request failed almost instantly. Since we want to stop these from running, we can call the cancel method on them. This will give us the following output:
+
+```
+starting <function main at 0x105cfd280> with args () {}
+Done task count: 1
+Pending task count: 2
+finished <function main at 0x105cfd280> in 0.0044 second(s)
+ERROR:root:Request got an exception
+```
+
+***NOTE:*** Our application took almost no time to run, as we quickly reacted to the fact that one of our requests threw an exception; the power of using this option is we achieve fail fast behavior, quickly reacting to any issues that arise.
+
+## Processing results as they complete
+
+Both ALL_COMPLETED and FIRST_EXCEPTION have the drawback that, in the case where coroutines are successful and don’t throw an exception, we must wait for all coroutines to complete. Depending on the use case, this may be acceptable, but if we’re in a situation where we want to respond to a coroutine as soon as it completes successfully, we are out of luck.
+
+In the instance in which we want to react to a result as soon as it completes, we could use as_completed; however, the issue with as_completed is there is no easy way to see which tasks are remaining and which tasks have completed. We get them only one at a time through an iterator.
+
+The good news is that the return_when parameter accepts a FIRST_COMPLETED option. This option will make the wait coroutine return as soon as it has at least one result. This can either be a coroutine that failed or one that ran successfully. We can then either cancel the other running coroutines or adjust which ones to keep running, depending on our use case. Let’s use this option to make a few web requests and process whichever one finishes first.
+
+```Python3
+import asyncio
+import aiohttp
+from util import async_timed
+
+from aiohttp import ClientSession
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    url = 'https://www.example.com'
+
+    fetchers = [
+      asyncio.create_task(fetch_status(session, url)),
+      asyncio.create_task(fetch_status(session, url)),
+      asyncio.create_task(fetch_status(session, url))
+    ]
+
+    done, pending = await asyncio.wait(fetchers, return_when=asyncio.FIRST_COMPLETED)
+
+    print(f'Done task count: {len(done)}')
+    print(f'Pending task count: {len(pending)}')
+
+    for done_task in done:
+      print(await done_task)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+In the preceding listing, we start three requests concurrently. Our wait coroutine will return as soon as any of these requests completes. This means that done will have one complete request, and pending will contain anything still running, giving us the following output:
+
+```
+starting <function main at 0x10222f1f0> with args () {}
+Done task count: 1
+Pending task count: 2
+200
+finished <function main at 0x10222f1f0> in 0.1138 second(s)
+```
+
+These requests can complete at nearly the same time, so we could also see output that says two or three tasks are done. Try running this listing a few times to see how the result varies.
+
+This approach lets us respond right away when our first task completes. What if we want to process the rest of the results as they come in like as_completed? The above example can be adopted easily to loop on the pending tasks until they are empty. This will give us behavior similar to as_completed, with the benefit that at each step we know exactly which tasks have finished and which are still running.
+
+```Python3
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
+from util import async_timed
+
+
+async def fetch_status(session: ClientSession, url: str) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    url = 'https://www.example.com'
+
+    pending = [
+      asyncio.create_task(fetch_status(session, url)),
+      asyncio.create_task(fetch_status(session, url)),
+      asyncio.create_task(fetch_status(session, url))
+    ]
+
+    while pending:
+      done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+      print(f'Done task count: {len(done)}')
+      print(f'Pending task count: {len(pending)}')
+
+      for done_task in done:
+        print(await done_task)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+In the preceding listing, we create a set named pending that we initialize to the coroutines we want to run. We loop while we have items in the pending set and call wait with that set on each iteration. Once we have a result from wait, we update the done and pending sets and then print out any done tasks. This will give us behavior similar to as_completed with the difference being we have better insight into which tasks are done and which tasks are still running. Running this, we’ll see the following output:
+
+```
+starting <function main at 0x10d1671f0> with args () {}
+Done task count: 1
+Pending task count: 2
+200
+Done task count: 1
+Pending task count: 1
+200
+Done task count: 1
+Pending task count: 0
+200
+finished <function main at 0x10d1671f0> in 0.1153 second(s)
+```
+
+Since the request function may complete quickly, such that all requests complete at the same time, it’s not impossible that we see output similar to this as well:
+
+```
+starting <function main at 0x1100f11f0> with args () {}
+Done task count: 3
+Pending task count: 0
+200
+200
+200
+finished <function main at 0x1100f11f0> in 0.1304 second(s)
+```
+
+## Handling timeouts
+
+In addition to allowing us finer-grained control on how we wait for coroutines to complete, wait also allows us to set timeouts to specify how long we want for all awaitables to complete. To enable this, we can set the timeout parameter with the maximum number of seconds desired. If we’ve exceeded this timeout, wait will return both the done and pending task set. There are a couple of differences in how timeouts behave in wait as compared to what we have seen thus far with wait_for and as_completed.
+
+> ***Coroutines are not canceled***
+> When we used wait_for, if our coroutine timed out it would automatically request cancellation for us. This is not the case with wait; it behaves closer to what we saw with gather and as_completed. In the case we want to cancel coroutines due to a timeout, we must explicitly loop over the tasks and cancel them.
+
+> ***Timeout errors are not raised***
+> wait does not rely on exceptions in the event of timeouts as do wait_for and as_ completed. Instead, if the timeout occurs the wait returns all tasks done and all tasks that are still pending up to that point when the timeout occurred.
+
+For example, let’s examine a case where two requests complete quickly and one takes a few seconds. We’ll use a timeout of 1 second with wait to understand what happens when we have tasks that take longer than the timeout. For the return_when parameter, we’ll use the default value of ALL_COMPLETED.
+
+```Python3
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
+from util import async_timed
+
+
+async def fetch_status(session: ClientSession, url: str, delay: int = 0) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  if delay != 0:
+    asyncio.wait(delay)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+@async_timed()
+async def main():
+  async with aiohttp.ClientSession() as session:
+    url = 'https://www.example.com'
+
+    fetchers = [
+      asyncio.create_task(fetch_status(session, url)),
+      asyncio.create_task(fetch_status(session, url)),
+      asyncio.create_task(fetch_status(session, url, delay=3))
+    ]
+
+    done, pending = await asyncio.wait(fetchers, timeout=1)
+
+    print(f'Done task count: {len(done)}')
+    print(f'Pending task count: {len(pending)}')
+
+    for done_task in done:
+      result = await done_task
+      print(result)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+Running the preceding listing, our wait call will return our done and pending sets after 1 second. In the done set we’ll see our two fast requests, as they finished within 1 second. Our slow request is still running and is, therefore, in the pending set. We then await the done tasks to extract out their return values. We also could have canceled the pending task if we so desired. Running this code, we will see the following output:
+
+```
+starting <function main at 0x11c68dd30> with args () {}
+Done task count: 2
+Pending task count: 1
+200
+200
+finished <function main at 0x11c68dd30> in 1.0022 second(s)
+```
+
+Note that, as before, our tasks in the pending set are not canceled and will continue to run despite the timeout. If we have a use case where we want to terminate the pending tasks, we’ll need to explicitly loop through the pending set and call cancel on each task.
+
+## Why wrap everything in a task?
+
+At the start of this section, we mentioned that it is best practice to wrap the coroutines we pass into wait in tasks. Why is this? Let’s go back to our previous timeout example and change it a little bit. Let’s say that we have requests to two different web APIs that we’ll call API A and API B. Both can be slow, but our application can run without the result from API B, so it is just a “nice to have.” Since we’d like a responsive application, we set a timeout of 1 second for the requests to complete. If the request to API B is still pending after that timeout, we cancel it and move on. Let’s see what happens if we implement this without wrapping the requests in tasks.
+
+```Python3
+import asyncio
+import aiohttp
+from aiohttp import ClientSession
+from util import async_timed
+
+
+async def fetch_status(session: ClientSession, url: str, delay_seconds: int = 0) -> int:
+  ten_millis = aiohttp.ClientTimeout(total=1)
+
+  if delay_seconds != 0:
+    await asyncio.sleep(delay_seconds)
+
+  async with session.get(url, timeout=ten_millis) as result:
+    print(result.status)
+    return result.status
+
+
+async def main():
+  async with aiohttp.ClientSession() as session:
+    api_a = fetch_status(session, 'https://www.example.com')
+    api_b = fetch_status(session, 'https://www.example.com', delay_seconds=2)
+
+    done, pending = await asyncio.wait([api_a, api_b], timeout=1)
+
+    for task in pending:
+      if task is api_b:
+        print('API B too slow, cancelling')
+        task.cancel()
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+We’d expect for this code to print out API B is too slow and cancelling, but what happens if we don’t see this message at all? This can happen because when we call wait with just coroutines they are automatically wrapped in tasks, and the done and pending sets returned are those tasks that wait created for us. This means that we can’t do any comparisons to see which specific task is in the pending set such as if task is api_b, since we’ll be comparing a task object, we have no access to with a coroutine. However, if we wrap fetch_status in a task, wait won’t create any new objects, and the comparison if task is api_b will work as we expect. In this case, we’re correctly comparing two task objects
+
