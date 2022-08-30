@@ -2371,3 +2371,438 @@ We’d expect for this code to print out API B is too slow and cancelling, but w
 # 5. Non-blocking database drivers
 
 \-
+
+# 6. Handling CPU-bound work
+
+## Introducing the multiprocessing library
+
+In chapter 1, we introduced the global interpreter lock. The global interpreter lock prevents more than one piece of Python bytecode from running in parallel. This means that for anything other than I/O-bound tasks, excluding some small exceptions, using multithreading won’t provide any performance benefits, the way it would in languages such as Java and C++. It seems like we might be stuck with no solution for our parallelizable CPU-bound work in Python, but this is where the multiprocessing library provides a solution.
+
+Instead of our parent process spawning threads to parallelize things, we instead spawn subprocesses to handle our work. Each subprocess will have its own Python interpreter and be subject to the GIL, but instead of one interpreter we’ll have several, each with its own GIL. Assuming we run on a machine with multiple CPU cores, this means that we can parallelize any CPU-bound workload effectively. Even if we have more processes than cores, our operating system will use preemptive multitasking to allow our multiple tasks to run concurrently. This setup is both concurrent and parallel.
+
+To get started with the multiprocessing library, let’s start by running a couple of functions in parallel. We’ll use a very simple CPU-bound function that counts from zero to a large number to examine how the API works as well as the performance benefits.
+
+```Python3
+import time
+from multiprocessing import Process
+
+
+def count(count_to: int) -> int:
+  start = time.perf_counter()
+
+  counter = 0
+  while counter < count_to:
+    counter += 1
+
+  end = time.perf_counter()
+
+  print(f"Finished counting to {count_to} in {end - start}")
+  return counter
+
+
+if __name__ == '__main__':
+  start_time = time.perf_counter()
+
+  # Create a process to run the countdown function
+  to_one_hundred_million = Process(target=count, args=(100000000,))
+  to_two_hundred_million = Process(target=count, args=(200000000,))
+
+  # Start the process. This method returns instantly.
+  to_one_hundred_million.start()
+  to_two_hundred_million.start()
+
+  # Wait for the process to finish. This method blocks until the process is done.
+  to_one_hundred_million.join()
+  to_two_hundred_million.join()
+
+  end_time = time.perf_counter()
+  print(f"Completed in {end_time - start_time}")
+```
+
+In the preceding listing, we create a simple count function which takes an integer and loops one by one until we count to the integer we pass in. We then create two processes, one to count to 100,000,000 and one to count to 200,000,000. The Process class takes in two arguments, a target which is the function name we wish to run in the process and args representing a tuple of arguments we wish to pass to the function. We then call the start method on each process. This method returns instantly and will start running the process. In this example we start both processes one after another. We then call the join method on each process. This will cause our main process to block until each process has finished. Without this, our program would exit almost instantly and terminate the subprocesses, as nothing would be waiting for their completion. Listing 6.1 runs both count functions concurrently; assuming we’re running on a machine with at least two CPU cores, we should see a speedup. When this code runs on a 2.5 GHz 8-core machine, we achieve the following results:
+
+```
+Finished counting down from 100000000 in 5.3844
+Finished counting down from 200000000 in 10.6265
+Completed in 10.8586
+```
+
+In total, our countdown functions took a bit over 16 seconds, but our application finished in just under 11 seconds. This gives us a time savings over running sequentially of about 5 seconds. Of course, the results you see when you run this will be highly variable depending on your machine, but you should see something directionally equivalent to this.
+
+Notice the addition of if __name__ == "__main__": to our application where we haven’t before. This is a quirk of the multiprocessing library; if you don’t add this you may receive the following error: An attempt has been made to start a new process before the current process has finished its bootstrapping phase. The reason this happens is to prevent others who may import your code from accidentally launching multiple processes.
+
+This gives us a decent performance gain; however, it is awkward because we must call start and join for each process we start. We also don’t know which process will complete first; if we want to do something like asyncio.as_completed and process results as they finish, we’re out of luck. The join method also does not return the value our target function returns; in fact, currently there is no way to get the value our function returns without using shared inter-process memory!
+
+This API will work for simple cases, but it clearly won’t work if we have functions where we want to get the return value out or want to process results as soon as they come in. Luckily, process pools provide a way for us to deal with this.
+
+## Using process pools
+
+In the previous example, we manually created processes and called their start and join methods to run and wait for them. We identified several issues with this approach, from code quality to not having the ability to access the results our process returned. The multiprocessing module has an API that lets us deal with this issue, called process pools.
+
+We create a collection of Python processes that we can use to run functions in parallel. When we have a CPU-bound function we wish to run in a process, we ask the pool directly to run it for us. Behind the scenes, this will execute this function in an available process, running it and returning the return value of that function. To see how a process pool works, let’s create a simple one and run a few “hello world”-style functions with it.
+
+```Python3
+import multiprocessing
+from multiprocessing import Pool
+
+
+def say_hello(name: str) -> str:
+  return f'Hi there, {name}'
+
+
+if __name__ == '__main__':
+  # Create a new process pool.
+  with Pool() as process_pool:
+    hi_jeff = process_pool.apply(say_hello, args=('Jeff',))
+    hi_john = process_pool.apply(say_hello, args=('John',))
+
+    print(hi_jeff)
+    print(hi_john)
+```
+
+In the preceding listing, we create a process pool using with Pool() as process_pool. This is a context manager because once we are done with the pool, we need to appropriately shut down the Python processes we created. If we don’t do this, we run the risk of leaking processes, which can cause resource-utilization issues. When we instantiate this pool, it will automatically create Python processes equal to the number of CPU cores on the machine you’re running on. You can determine the number of CPU cores you have in Python by running the multiprocessing.cpu_count() function. You can set the processes argument to any integer you’d like when you call Pool(). The default value is usually a good starting point.
+
+Next, we use the apply method of the process pool to run our say_hello function in a separate process. This method looks similar to what we did previously with the Process class, where we passed in a target function and a tuple of arguments. The difference here is that we don’t need to start the process or call join on it ourselves. We also get back the return value of our function, which we couldn’t do in the previous example. Running this code, you should see the following printed out:
+
+```
+Hi there, Jeff
+Hi there, John
+```
+
+This works, but there is a problem. The apply method blocks until our function completes. That means that, if each call to say_hello took 10 seconds, our entire program’s run time would be about 20 seconds because we’ve run things sequentially, negating the point of running in parallel. We can solve this problem by using the process pool’s apply_async method.
+
+## Using asynchronous results
+
+In the previous example, each call to apply blocked until our function completed. This doesn’t work if we want to build a truly parallel workflow. To work around this, we can use the apply_async method instead. This method returns an AsyncResult instantly and will start running the process in the background. Once we have an AsyncResult, we can use its get method to block and obtain the results of our function call. Let’s take our say_hello example and adapt it to use asynchronous results.
+
+```Python3
+from multiprocessing import Pool
+
+
+def say_hello(name: str) -> str:
+  return f'Hi there, {name}'
+
+
+if __name__ == '__main__':
+  # Create a new process pool.
+  with Pool() as process_pool:
+    hi_jeff = process_pool.apply_async(say_hello, args=('Jeff',))
+    hi_john = process_pool.apply_async(say_hello, args=('John',))
+
+    print(hi_jeff.get())
+    print(hi_john.get())
+```
+
+When we call apply_async, our two calls to say_hello start instantly in separate processes. Then, when we call the get method, our parent process will block until each process returns a value. This lets things run concurrently, but what if hi_jeff took 10 seconds, but hi_john only took one? In this case, since we call get on hi_jeff first, our program would block for 10 seconds before printing our hi_john message even though we were ready after only 1 second. If we want to respond to things as soon as they finish, we’re left with an issue. What we really want is something like asyncio’s as_completed in this instance. Next, let’s see how to use process pool executors with asyncio, so we can address this issue.
+
+## Using process pool executors with asyncio
+
+We’ve seen how to use process pools to run CPU-intensive operations concurrently. These pools are good for simple use cases, but Python offers an abstraction on top of multiprocessing’s process pools in the concurrent.futures module. This module contains executors for both processes and threads that can be used on their own but also interoperate with asyncio. To get started, we’ll learn the basics of ProcessPool- Executor, which is similar to ProcessPool. Then, we’ll see how to hook this into asyncio, so we can use the power of its API functions, such as gather.
+
+## Introducing process pool executors
+
+Python’s process pool API is strongly coupled to processes, but multiprocessing is one of two ways to implement preemptive multitasking, the other being multithreading. What if we need to easily change the way in which we handle concurrency, seamlessly switching between processes and threads? If we want a design like this, we need to build an abstraction that encompasses the core of distributing work to a pool of resources that does not care if those resources are processes, threads, or some other construct.
+
+The concurrent.futures module provides this abstraction for us with the Executor abstract class. This class defines two methods for running work asynchronously. The first is submit, which will take a callable and return a Future (note that this is not the same as asyncio futures but is part of the concurrent.futures module)—this is equivalent to the Pool.apply_async method we saw in the last section. The second is map. This method will take a callable and a list of function arguments and then execute each argument in the list asynchronously. It returns an iterator of the results of our calls similarly to asyncio.as_completed in that results are available once they complete. Executor has two concrete implementations: ProcessPool- Executor and ThreadPoolExecutor. Since we’re using multiple processes to handle CPU-bound work, we’ll focus on ProcessPoolExecutor. In chapter 7, we’ll examine threads with ThreadPoolExecutor. To learn how a ProcessPoolExecutor works, we’ll reuse our count example with a few small numbers and a few large numbers to show how results come in.
+
+```Python3
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+
+def count(count_to: int) -> int:
+  start = time.perf_counter()
+
+  counter = 0
+  while counter < count_to:
+    counter += 1
+
+  end = time.perf_counter()
+
+  print(f'Finished counting to {count_to} in {end - start}')
+  return counter
+
+
+if __name__ == '__main__':
+  with ProcessPoolExecutor() as process_pool:
+    numbers = [1, 3, 5, 22, 100000000]
+    for result in process_pool.map(count, numbers):
+      print(result)
+```
+
+Much like before, we create a ProcessPoolExecutor in context manager. The number of resources also defaults to the number of CPU cores our machine has, as process pools did. We then use process_pool.map with our count function and a list of numbers that we want to count to.
+
+When we run this, we’ll see that our calls to countdown with a low number will finish quickly and be printed out nearly instantly. Our call with 100000000 will, however, take much longer and will be printed out after the few small numbers, giving us the following output:
+
+```
+Finished counting down from 1 in 9.5367e-07
+Finished counting down from 3 in 9.5367e-07
+Finished counting down from 5 in 9.5367e-07
+Finished counting down from 22 in 3.0994e-06
+1
+3
+5
+22
+Finished counting down from 100000000 in 5.2097
+100000000
+```
+
+While it seems that this works the same as asyncio.as_completed, the order of iteration is deterministic based on the order we passed in the numbers list. This means that if 100000000 was our first number, we’d be stuck waiting for that call to finish before we could print out the other results that completed earlier. This means we aren’t quite as responsive as asyncio.as_completed.
+
+## Process pool executors with the asyncio event loop
+
+Now that we've known the basics of how process pool executors work, let’s see how to hook them into the asyncio event loop. This will let us use the API functions such as gather and as_completed that we learned of in chapter 4 to manage multiple processes.
+
+Creating a process pool executor to use with asyncio is no different from what we just learned; that is, we create one in within a context manager. Once we have a pool, we can use a special method on the asyncio event loop called run_in_executor. This method will take in a callable alongside an executor (which can be either a thread pool or process pool) and will run that callable inside the pool. It then returns an awaitable, which we can use in an await statement or pass into an API function such as gather.
+
+Let’s implement our previous count example with a process pool executor. We’ll submit multiple count tasks to the executor and wait for them all to finish with gather. run_in_executor only takes a callable and does not allow us to supply function arguments; so, to get around this, we’ll use partial function application to build countdown calls with 0 arguments.
+
+```Python3
+import asyncio
+from asyncio.events import AbstractEventLoop
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+from typing import List
+
+
+def count(count_to: int) -> int:
+  counter = 0
+  while counter < count_to:
+    counter += 1
+
+  return counter
+
+
+async def main():
+  with ProcessPoolExecutor() as process_pool:
+    # Create a partially applied function for countdown with its argument
+    loop: AbstractEventLoop = asyncio.get_running_loop()
+
+    nums = [1, 3, 5, 22, 100000000]
+
+    # Submit each call to the process pool and append it to a list.
+    calls: List[partial[int]] = [partial(count, num) for num in nums]
+    call_coros = []
+
+    for call in calls:
+      call_coros.append(loop.run_in_executor(process_pool, call))
+
+    # Wait for all results to finish
+    results = await asyncio.gather(*call_coros)
+
+    for result in results:
+      print(result)
+
+
+if __name__ == '__main__':
+  asyncio.run(main())
+```
+
+We first create a process pool executor, as we did before. Once we have this, we get the asyncio event loop, since run_in_executor is a method on the AbstractEventLoop. We then partially apply each number in nums to the count function, since we can’t call count directly. Once we have count function calls, then we can submit them to the executor. We loop over these calls, calling loop.run_in_executor for each partially applied count function and keep track of the awaitable it returns in call_coros. We then take this list and wait for everything to finish with asyncio.gather.
+
+If we had wanted, we could also use asyncio.as_completed to get the results from the subprocesses as they completed. This would solve the problem we saw earlier with process pool’s map method, where if we had a task it took a long time.
+
+We’ve now seen all we need to start using process pools with asyncio. Next, let’s look at how to improve the performance of a real-world problem with multiprocessing and asyncio.
+
+## Shared data and locks
+
+In chapter 1, we discussed the fact that, in multiprocessing, each process has its own memory, separate from other processes. This presents a challenge when we have shared state to keep track of. So how can we share data between processes if their memory spaces are all distinct?
+
+Multiprocessing supports a concept called shared memory objects. A shared memory object is a chunk of memory allocated that a set of separate processes can access. Each process, as shown in figure 6.2, can then read and write into that memory space as needed.
+
+Shared state is complicated and can lead to hard-to-reproduce bugs if not properly implemented. Generally, it is best to avoid shared state if possible. That said, sometimes it is necessary to introduce shared state. One such instance is a shared counter.
+
+![Figure](ScreenshotsForNotes/Chapter6/Figure_6_2.PNG)
+
+## Sharing data and race conditions
+
+Multiprocessing supports two kinds of shared data: values and array. A value is a singular value, such as an integer or floating-point number. An array is an array of singular values. The types of data that we can share in memory are limited by the types defined in the Python array module, available at https://docs.python.org/3/library/array .html#module-array.
+
+To create a value or array, we first need to use the typecode from the array module that is just a character. Let’s create two shared pieces of data—one integer value and one integer array. We’ll then create two processes to increment each of these shared pieces of data in parallel.
+
+```Python3
+from multiprocessing import Process, Value, Array
+
+
+def increment_value(shared_int: Value):
+  shared_int.value += 1
+
+
+def increment_array(shared_array: Array):
+  for index, integer in enumerate(shared_array):
+    shared_array[index] = integer + 1
+
+
+if __name__ == '__main__':
+  integer = Value('i', 0)
+  integer_array = Array('i', [0, 0])
+
+  procs = [
+    Process(target=increment_value, args=(integer,)),
+    Process(target=increment_array, args=(integer_array,))
+  ]
+
+  [p.start() for p in procs]
+  [p.join() for p in procs]
+
+  print(integer.value)
+  print(integer_array[:])
+```
+
+In the preceding listing, we create two processes—one to increment our shared integer value and one to increment each element in our shared array. Once our two subprocesses complete, we print out the data.
+
+Since our two pieces of data are never touched by different processes, this code works well. Will this code continue to work if we have multiple processes modifying the same shared data? Let’s test this out by creating two processes to increment a shared integer value in parallel. We’ll run this code repeatedly in a loop to see if we get consistent results. Since we have two processes, each incrementing a shared counter by one, once the processes finish we expect the shared value to always be two.
+
+```Python3
+from multiprocessing import Process, Value, Array
+
+
+def increment_value(shared_int: Value):
+  shared_int.value += 1
+
+
+if __name__ == '__main__':
+  for _ in range(100):
+    integer = Value('i', 0)
+
+    procs = [
+      Process(target=increment_value, args=(integer,)),
+      Process(target=increment_value, args=(integer,)),
+    ]
+
+    [p.start() for p in procs]
+    [p.join() for p in procs]
+
+    print(integer.value)
+    assert (integer.value == 2)
+```
+
+While you will see different output because this problem is nondeterministic, at some point you should see that the result isn’t always 2.
+
+```
+2
+2
+2
+Traceback (most recent call last):
+File "listing_6_11.py", line 17, in <module>
+assert(integer.value == 2)
+AssertionError
+1
+```
+
+Sometimes our result is 1! Why is this? What we’ve encountered is called a race condition. A race condition occurs when the outcome of a set of operations is dependent on which operation finishes first. You can imagine the operations as racing against one another; if the operations win the race in the right order, everything works fine. If they win the race in the wrong order, bizarre behavior results.
+
+So where is the race occurring in our example? The problem lies in that incrementing a value involves both read and write operations. To increment a value, we first need to read the value, add one to it, then write the result back to memory. The value each process sees in the shared data is entirely dependent on when it reads the shared value.
+
+If the processes run in the following order, everything works fine, as seen in figure 6.3.
+
+![Figure](ScreenshotsForNotes/Chapter6/Figure_6_3.PNG)
+
+In this example, Process 1 increments the value just before Process 2 reads it and wins the race. Since Process 2 finishes second, this means that it will see the correct value of one and will add to it, producing the correct final value.
+
+What happens if there is a tie in our virtual race? Look at figure 6.4.
+
+![Figure](ScreenshotsForNotes/Chapter6/Figure_6_4.PNG)
+
+In this instance, Processes 1 and 2 both read the initial value of zero. They then increment that value to 1 and write it back at the same time, producing the incorrect value.
+
+You may ask, “But our code is only one line. Why are there two operations!?” Under the hood, incrementing is written as two operations, which causes this issue. This makes it non-atomic or not thread-safe. This isn’t easy to figure out. 
+
+These types of errors are tricky because they are often difficult to reproduce. They aren’t like normal bugs, since they depend on the order in which our operating system runs things, which is out of our control when we use multiprocessing. So how do we fix this nasty bug?
+
+## Synchronizing with locks
+
+We can avoid race conditions by synchronizing access to any shared data we want to modify. What does it mean to synchronize access? Revisiting our race example, it means that we control access to any shared data so that any operations we have finish the race in an order that makes sense. If we’re in a situation where a tie between two operations could occur, we explicitly block the second operation from running until the first completes, guaranteeing operations to finish the race in a consistent manner. You can imagine this as a referee at the finish line, seeing that a tie is about to happen and telling the runners, “Hold up a minute. One racer at a time!” and picking one runner to wait while the other crosses the finish line.
+
+One mechanism for synchronizing access to shared data is a lock, also known as a mutex (short for mutual exclusion). These structures allow for a single process to “lock” a section of code, preventing other processes from running that code. The locked section of code is commonly called a critical section. This means that if one process is executing the code of a locked section and a second process tries to access that code, the second process will need to wait (blocked by the referee) until the first process is finished with the locked section.
+
+Locks support two primary operations: acquiring and releasing. When a process acquires a lock, it is guaranteed that it will be the only process running that section of code. Once the section of code that needs synchronized access is finished, we release the lock. This allows other processes to acquire the lock and run any code in the critical section. If a process tries to run code that is locked by another process, acquiring the lock will block until the other process releases that lock.
+
+Revisiting our counter race condition example, and using figure 6.5, let’s visualize what happens when two processes try and acquire a lock at roughly the same time. Then, let’s see how it prevents the counter from getting the wrong value.
+
+In this diagram, Process 1 first acquires the lock successfully and reads and increments the shared data. The second process tries to acquire the lock but is blocked from advancing further until the first process releases the lock. Once the first process releases the lock, the second process can successfully acquire the lock and increment the shared data. This prevents the race condition because the lock prevents more than one process from reading and writing the shared data at the same time.
+
+So how do we implement this synchronization with our shared data? The multiprocessing API implementors thought of this and nicely included a method to get a lock on both value and array. To acquire a lock, we call get_lock().acquire() and to release a lock we call get_lock().release(). Using listing 6.12, let’s apply this to our previous example to fix our bug.
+
+![Figure](ScreenshotsForNotes/Chapter6/Figure_6_5.PNG)
+
+```Python3
+from multiprocessing import Process, Value, Array
+
+
+def increment_value(shared_int: Value):
+  shared_int.get_lock().acquire()
+  shared_int.value += 1
+  shared_int.get_lock().release()
+
+
+if __name__ == '__main__':
+  for _ in range(100):
+    integer = Value('i', 0)
+
+    procs = [
+      Process(target=increment_value, args=(integer,)),
+      Process(target=increment_value, args=(integer,)),
+    ]
+
+    [p.start() for p in procs]
+    [p.join() for p in procs]
+
+    print(integer.value)
+    assert (integer.value == 2)
+```
+
+When we run this code, every value we get should be 2. We’ve fixed our race condition! Note that locks are also context managers, and to clean up our code we could have written increment_value using a with block. This will acquire and release the lock for us automatically:
+
+```Python3
+def increment_value(shared_int: Value):
+    with shared_int.get_lock():
+        shared_int.value = shared_int.value + 1
+```
+
+Notice that we have taken concurrent code and have just forced it to be sequential, negating the value of running in parallel. This is an important observation and is a caveat of synchronization and shared data in concurrency in general. To avoid race conditions, we must make our parallel code sequential in critical sections. This can hurt the performance of our multiprocessing code. Care must be taken to lock only the sections that absolutely need it so that other parts of the application can execute concurrently. When faced with a race condition bug, it is easy to protect all your code with a lock. This will “fix” the problem but will likely degrade your application’s performance.
+
+## Sharing data with process pools
+
+We’ve just seen how to share data within a couple of processes, so how do we apply this knowledge to process pools? Process pools operate a bit differently than creating processes manually, posing a challenge with shared data. Why is this?
+
+When we submit a task to a process pool, it may not run immediately because the processes in the pool may be busy with other tasks. How does the process pool handle this? In the background, process pool executors keep a queue of tasks to manage this. When we submit a task to the process pool, its arguments are pickled (serialized) and put on the task queue. Then, each worker process asks for a task from the queue when it is ready for work. When a worker process pulls a task off the queue, it unpickles (deserializes) the arguments and begins to execute the task.
+
+Shared data is, by definition, shared among worker processes. Therefore, pickling and unpickling it to send it back and forth between processes makes little sense. In fact, neither Value nor Array objects can be pickled, so if we try to pass the shared data in as arguments to our functions as we did before, we’ll get an error along the lines of can’t pickle Value objects.
+
+To handle this, we’ll need to put our shared counter in a global variable and somehow let our worker processes know about it. We can do this with process pool initializers. These are special functions that are called when each process in our pool starts up. Using this, we can create a reference to the shared memory that our parent process created. We can pass this function in when we create a process pool. To see how this works, let’s create a simple example that increments a counter.
+
+```Python3
+from concurrent.futures import ProcessPoolExecutor
+import asyncio
+from multiprocessing import Value
+
+shared_counter: Value
+
+
+def init(counter: Value):
+  global shared_counter
+  shared_counter = counter
+
+
+def increment():
+  with shared_counter.get_lock():
+    shared_counter.value += 1
+
+
+async def main():
+  counter = Value('d', 0)
+  # This tells the pool to execute the function init with the argument counter for each process.
+  with ProcessPoolExecutor(initializer=init, initargs=(counter,)) as pool:
+    await asyncio.get_running_loop().run_in_executor(pool, increment)
+    print(counter.value)
+
+
+if __name__ == '__main__':
+  asyncio.run(main())
+```
+
+We first define a global variable, shared_counter, which will contain the reference to the shared Value object we create. In our init function, we take in a Value and initialize shared_counter to that value. Then, in the main coroutine, we create the counter and initialize it to 0, then pass in our init function and our counter to the initializer and initargs parameter when creating the process pool. The init function will be called for each process that the process pool creates, correctly initializing our shared_ counter to the one we created in our main coroutine.
+
+You may ask, “Why do we need to bother with all this? Can’t we just initialize the global variable as shared_counter: Value = Value('d', 0) instead of leaving it empty?” The reason we can’t do this is that when each process is created, the script we created it from is run again, per each process. This means that each process that starts will execute shared_counter: Value = Value('d', 0), meaning that if we have 100 processes, we’d get 100 shared_counter values, each set to 0, resulting in some strange behavior
+
