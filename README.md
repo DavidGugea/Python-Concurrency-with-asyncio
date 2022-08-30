@@ -2368,3 +2368,6 @@ asyncio.run(main())
 
 We’d expect for this code to print out API B is too slow and cancelling, but what happens if we don’t see this message at all? This can happen because when we call wait with just coroutines they are automatically wrapped in tasks, and the done and pending sets returned are those tasks that wait created for us. This means that we can’t do any comparisons to see which specific task is in the pending set such as if task is api_b, since we’ll be comparing a task object, we have no access to with a coroutine. However, if we wrap fetch_status in a task, wait won’t create any new objects, and the comparison if task is api_b will work as we expect. In this case, we’re correctly comparing two task objects
 
+# 5. Non-blocking database drivers
+
+\-
