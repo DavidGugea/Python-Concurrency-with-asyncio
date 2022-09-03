@@ -3397,3 +3397,7 @@ Transmitting data to and from a socket is only part of the equation. What about 
 
 ![Figure](ScreenshotsForNotes/Chapter8/Figure_8_1.PNG)
 ![Figure](ScreenshotsForNotes/Chapter8/Figure_8_2.PNG)
+
+# 9. Web applications
+
+\-
