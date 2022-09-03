@@ -3378,3 +3378,22 @@ asyncio.run(main())
 ```
 
 This approach involves us creating a thread pool executor and creating a task for each password we want to hash. Since hashlib releases the GIL we realize some decent performance gains. This code runs in about 5 seconds as opposed to the 40 we got earlier. We’ve just cut our runtime down from 47 days to a bit over 5! As a next step, we could take this application and run it concurrently on different machines to further cut runtime, or we could get a machine with more CPU cores
+
+# 8. Streams
+
+## Introducing streams
+
+In asyncio, streams are a high-level set of classes and functions that create and manage network connections and generic streams of data. Using them, we can create client connections to read and write to servers, or even create servers and manage them ourselves.
+
+These APIs abstract a lot of knowledge around managing sockets, such as dealing with SSL or lost connections, making our lives as developers a little easier. The stream APIs are built on top of a lower-level set of APIs known as transports and protocols. These APIs directly wrap the sockets we used in previous chapters (generally, any generic stream of data), providing us with a clean API for reading and writing data to sockets.
+
+These APIs are structured a little differently from others in that they use a callback style design. Instead of actively waiting for data from a socket like we did previously, a method on a class we implement is called for us when data is available. We then process the data we receive in this method as needed. To get started learning how these callback-based APIs work, let’s first see how to use the lower-level transport and protocol APIs by building a basic HTTP client.
+
+## Transports and protocols
+
+At a high level, a transport is an abstraction for communication with an arbitrary stream of data. When we communicate with a socket or any data stream such as standard input, we work with a familiar set of operations. We read data from or write data to a source, and when we’re finished working with it, we close it. A socket cleanly fits how we’ve defined this transport abstraction; that is, we read and write data to it and once we’ve finished, we close it. In short, a transport provides definitions for sending and receiving data to and from a source. Transports have several implementations depending on which type of source we’re using. We’re mainly concerned with Read- Transport, WriteTransport, and Transport, though there are others for dealing with UDP connections and subprocess communication. Figure 8.1 illustrates the class hierarchy of transports.
+
+Transmitting data to and from a socket is only part of the equation. What about the lifecycle of a socket? We establish a connection; we write data and then process any response we get. These are the set of operations a protocol owns. Note that a protocol simply refers to a Python class here and not a protocol like HTTP or FTP. A transport manages data transmission and calls methods on a protocol when events occur, such as a connection being established or data being ready to process, as shown in figure 8.2.
+
+![Figure](ScreenshotsForNotes/Chapter8/Figure_8_1.PNG)
+![Figure](ScreenshotsForNotes/Chapter8/Figure_8_2.PNG)
