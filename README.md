@@ -2806,3 +2806,575 @@ We first define a global variable, shared_counter, which will contain the refere
 
 You may ask, “Why do we need to bother with all this? Can’t we just initialize the global variable as shared_counter: Value = Value('d', 0) instead of leaving it empty?” The reason we can’t do this is that when each process is created, the script we created it from is run again, per each process. This means that each process that starts will execute shared_counter: Value = Value('d', 0), meaning that if we have 100 processes, we’d get 100 shared_counter values, each set to 0, resulting in some strange behavior
 
+# 7. Handling blocking work with threads
+
+## Introducing the threading module
+
+Python lets developers create and manage threads via the threading module. This module exposes the Thread class, which, when instantiated, accepts a function to run in a separate thread. The Python interpreter runs single-threaded within a process, meaning that only one piece of Python bytecode can be running at one time even if we have code running in multiple threads. The global interpreter lock will only allow one thread to execute code at a time.
+
+This seems like Python limits us from using multithreading to any advantage, but there are a few cases in which the global interpreter lock is released, the primary one being during I/O operations. Python can release the GIL in this case because, under the hood, Python is making low-level operating system calls to perform I/O. These system calls are outside the Python interpreter, meaning that no Python bytecode needs to run while we’re waiting for I/O to finish.
+
+To get a better sense of how to create and run threads in the context of blocking I/O, we’ll revisit our example of an echo server from chapter 3. Recall that to handle multiple connections, we needed to switch our sockets to non-blocking mode and use the select module to watch for events on the sockets. What if we were working with a legacy codebase where non-blocking sockets weren’t an option? Could we still build an echo server that can handle more than one client at a time?
+
+Since a socket’s recv and sendall are I/O-bound methods, and therefore release the GIL, we should be able to run them in separate threads concurrently. This means that we can create one thread per each connected client and read and write data in that thread. This model is a common paradigm in web servers such as Apache and is known as a thread-per-connection model. Let’s give this idea a try by waiting for connections in our main thread and then creating a thread to echo for each client that connects.
+
+```Python3
+from threading import Thread
+import socket
+
+
+def echo(client: socket.socket):
+  while True:
+    data = client.recv(2048)
+    print(f'Received {data}, sending!')
+    client.sendall(data)
+
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+  server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  server.bind(('127.0.0.1', 8000))
+  server.listen()
+
+  while True:
+    # Block waiting for a client to connect
+    connection, _ = server.accept()
+
+    # Once a client connects, create a thread to run our echo function.
+    thread = Thread(target=echo, args=(connection,))
+
+    # Start running the thread
+    thread.start()
+```
+
+In the preceding listing, we enter an infinite loop listening for connections on our server socket. Once we have a client connected, we create a new thread to run our echo function. We supply the thread with a target that is the echo function we want to run and args, which is a tuple of arguments passed to echo. This means that we’ll call echo(connection) in our thread. Then, we start the thread and loop again, waiting for a second connection. Meanwhile, in the thread we created, we loop forever listening for data from our client, and when we have it, we echo it back.]
+
+You should be able to connect an arbitrary amount of telnet clients concurrently and have messages echo properly. Since each recv and sendall operates in a separate thread per client, these operations never block each other; they only block the thread they are running in.
+
+This solves the problem of multiple clients being unable to connect at the same time with blocking sockets, although the approach has some issues unique to threads. What happens if we try to kill this process with CTRL-C while we have clients connected? Does our application shut down the threads we created cleanly?
+
+It turns out that things don’t shut down quite so cleanly. If you kill the application, you should see a KeyboardInterrupt exception thrown on server.accept(), but your application will hang as the background thread will keep the program alive. Furthermore, any connected clients will still be able to send and receive messages!
+
+Unfortunately, user-created threads in Python do not receive KeyboardInterrupt exceptions; only the main thread will receive them. This means that our threads will keep running, happily reading from our clients and preventing our application from exiting.
+
+There are a couple approaches to handle this; specifically, we can use what are called daemon threads (pronounced demon), or we can come up with our own way of canceling or “interrupting” a running thread. Daemon threads are a special kind of thread for long-running background tasks. These threads won’t prevent an application from shutting down. In fact, when only daemon threads are running, the application will shut down automatically. Since Python’s main thread is not a daemon thread, this means that, if we make all our connection threads daemonic, our application will terminate on a KeyboardInterrupt. Adapting our code from listing 7.1 to use daemonic threads is easy; all we need to do is set thread.daemon = True before we run thread.start(). Once we make that change, our application will terminate properly on CTRL-C.
+
+The problem with this approach is we have no way to run any cleanup or shutdown logic when our threads stop, since daemon threads terminate abruptly. Let’s say that on shutdown we want to write out to each client that the server is shutting down. Is there a way we can have some type of exception interrupt our thread and cleanly shut down the socket? If we call a socket’s shutdown method, any existing calls to recv will return zero, and sendall will throw an exception. If we call shutdown from the main thread, this will have the effect of interrupting our client threads that are blocking a recv or sendall call. We can then handle the exception in the client thread and perform any cleanup logic we’d like.
+
+To do this, we’ll create threads slightly differently than before, by subclassing the Thread class itself. This will let us define our own thread with a cancel method, inside of which we can shut down the client socket. Then, our calls to recv and sendall will be interrupted, allowing us to exit our while loop and close out the thread.
+
+The Thread class has a run method that we can override. When we subclass Thread, we implement this method with the code that we want the thread to run when we start it. In our case, this is the recv and sendall echo loop.
+
+```Python3
+from threading import Thread
+import socket
+
+
+class ClientEchoThread(Thread):
+  def __init__(self, client: socket.socket):
+    super().__init__()
+    self.client: socket.socket = client
+
+  def run(self):
+    try:
+      while True:
+        data = self.client.recv(2048)
+
+        # If there is no data, raise an exception. This happens when the connection was closed by the client or the connection was shut down.
+        if not data:
+          raise BrokenPipeError('Connection closed!')
+
+        print(f'Received {data}, sending!')
+
+        self.client.sendall(data)
+    except OSError as e:
+      # When we have an exception, exit the run method. This terminates the thread.
+      print(f'Thread interrupted by {e} exception, shutting down !')
+
+  def close(self):
+    # Shut down the connection if the thread is alive; the thread may not be alive if the client closed the connection
+    if self.is_alive():
+      self.client.sendall(bytes('Shutting down!', encoding='utf-8'))
+
+      # Shut down the client connection for reads and writes.
+      self.client.shutdown(socket.SHUT_RDWR)
+
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+  server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  server.bind(('127.0.0.1', 8000))
+  server.listen()
+  connection_threads = []
+
+  try:
+    while True:
+      connection, addr = server.accept()
+      thread = ClientEchoThread(connection)
+      connection_threads.append(thread)
+      thread.start()
+  except KeyboardInterrupt:
+    print('Shutting down')
+
+    # Call the close method on our threads to shut down each client connection on keyboard interrupt.
+    [thread.close() for thread in connection_threads]
+```
+
+We first create a new class, ClientEchoThread, that inherits from Thread. This class overrides the run method with the code from our original echo function, but with a few changes. First, we wrap everything in a try catch block and intercept OSError exceptions. This type of exception is thrown from methods such as sendall when we close the client socket. We also check to see if the data from recv is 0. This happens in two cases: if the client closes the connection (someone quits telnet, for example) or when we shut down the client connection ourselves. In this case we throw a Broken- PipeError ourselves (a subclass of OSError), execute the print statement in the except block, and exit the run method, which shuts down the thread.
+
+We also define a close method on our ClientEchoThread class. This method first checks to see if the thread is alive before shutting down the client connection. What does it mean for a thread to be “alive,” and why do we need to do this? A thread is alive if its run method is executing; in this case this is true if our run method does not throw any exceptions. We need this check because the client itself may have closed the connection, resulting in a BrokenPipeError exception in the run method before we call close. This means that calling sendall would result in an exception, as the connection
+
+is no longer valid. Finally, in our main loop, which listens for new incoming connections, we intercept KeyboardInterrupt exceptions. Once we have one, we call the close method on each thread we’ve created. This will send a message to the client, assuming the connection is still active and shut down the connection.
+
+Overall, canceling running threads in Python, and in general, is a tricky problem and depends on the specific shutdown case you’re trying to handle. You’ll need to take special care that your threads do not block your application from exiting and to figure out where to put in appropriate interrupt points to exit your threads.
+
+We’ve now seen a couple ways to manage threads manually ourselves, creating a thread object with a target function and subclassing Thread and overriding the run method. Now that we understand threading basics, let’s see how to use them with asyncio to work with popular blocking libraries.
+
+## Introducing thread pool executors
+
+Much like process pool executors, the concurrent.futures library provides an implementation of the Executor abstract class to work with threads named Thread- PoolExecutor. Instead of maintaining a pool of worker processes like a process pool does, a thread pool executor will create and maintain a pool of threads that we can then submit work to.
+
+While a process pool will by default create one worker process for each CPU core our machine has available, determining how many worker threads to create is a bit more complicated. Internally, the formula for the default number of threads is min(32, os.cpu_count() + 4). This causes the maximum (upper) bound of worker threads to be 32 and the minimum (lower) bound to be 5. The upper bound is set to 32 to avoid creating a surprising number of threads on machines with large amounts of CPU cores (remember, threads are resource-expensive to create and maintain). The lower bound is set to 5 because on smaller 1–2 core machines, spinning up only a couple of threads isn’t likely to improve performance much. It often makes sense to create a few more threads than your available CPUs for I/O-bound work. For example, on an 8-core machine the above formula means we’ll create 12 threads. While only 8 threads can run concurrently, we can have other threads paused waiting for I/O to finish, letting our operating resume them when I/O is done.
+
+Let’s adapt our example from listing 7.3 to run 1,000 HTTP requests concurrently with a thread pool. We’ll time the results to get an understanding of what the benefit is.
+
+```Python3
+import time
+import requests
+from concurrent.futures import ThreadPoolExecutor
+
+
+def get_status_code(url: str) -> int:
+  response = requests.get(url)
+  return response.status_code
+
+
+start = time.perf_counter()
+
+with ThreadPoolExecutor(max_workers=1000) as pool:
+  urls = ['https://www.example.com' for _ in range(1000)]
+  results = pool.map(get_status_code, urls)
+  for result in results:
+    print(result)
+
+end = time.perf_counter()
+print(f'finished requests in {end - start:.4f} second(s)')
+```
+
+On an 8-core machine with a speedy internet connection, this code can execute in as little as 8–9 seconds with the default number of threads. It is easy to write this synchronously to understand the impact that threading has by doing something, as in the following:
+
+```Python3
+start = time.perf_counter()
+
+urls = ['https://www.example.com' for _ in range(1000)]
+
+for url in urls:
+  print(get_status_code(url))
+
+end = time.perf_counter()
+
+print(f'finished requests in {end-start:.4f} second(s)')
+```
+
+Running this code can take upwards of 100 seconds! This makes our threaded code a bit more than 10 times faster than our synchronous code, giving us a pretty big performance bump.
+
+While this is clearly an improvement, you may remember from chapter 4, on aiohttp, that we were able to make 1,000 requests concurrently in less than 1 second. Why is this so much slower than our threading version? Remember that our maximum number of worker threads is limited to 32 (that is, the number of CPUs plus 4), meaning that by default we can only run a maximum of 32 requests concurrently. We can try to get around this by passing in max_workers=1000 when we create our thread pool, as in the following:
+
+```Python3
+with ThreadPoolExecutor(max_workers=1000) as pool:
+  urls = ['https://www.example.com' for _ in range(1000)]
+  results = pool.map(get_status_code, urls)
+  for result in results:
+      print(result)
+```
+
+This approach can yield some improvements, as we now have one thread per each request we make. However, this still won’t come very close to our coroutine-based code. This is due to the resource overhead associated with threads. Threads are created at the operating-system level and are more expensive to create than coroutines. In addition, threads have a context-switching cost at the OS level. Saving and restoring thread state when a context switch happens eats up some of the performance gains obtained by using threads.
+
+When you’re determining the number of threads to use for a particular problem, it is best to start small (the amount of CPU cores plus a few is a good starting point), test it, and benchmark it, gradually increasing the number of threads. You’ll usually find a “sweet spot,” after which the run time will plateau and may even degrade, no matter how many more threads you add. This sweet spot is usually a fairly low number relative to the requests you want to make (to make it clear, creating 1,000 threads for 1,000 requests probably isn’t the best use of resources).
+
+## Thread pool executors with asyncio
+
+Using thread pool executors with the asyncio event loop isn’t much different than using ProcessPoolExecutors. This is the beauty of having the abstract Executor base class in that we can use the same code to run threads or processes by only having to change one line of code. Let’s adapt our example of running 1,000 HTTP requests to use asyncio.gather instead of pool.map.
+
+```Python3
+import functools
+import requests
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+
+def get_status_code(url: str) -> int:
+  response = requests.get(url)
+  return response.status_code
+
+
+async def main():
+  loop = asyncio.get_running_loop()
+
+  with ThreadPoolExecutor() as pool:
+    urls = ['http://www.example.com' for _ in range(1000)]
+    tasks = [loop.run_in_executor(pool, functools.partial(get_status_code, url)) for url in urls]
+    results = await asyncio.gather(*tasks)
+    print(results)
+
+asyncio.run(main())
+```
+
+We create the thread pool as we did before, but instead of using map we create a list of tasks by calling our get_status_code function with loop.run_in_executor. Once we have a list of tasks, we can wait for them to finish with asyncio.gather or any of the other asyncio APIs we learned earlier.
+
+Internally, loop.run_in_executor calls the thread pool executor’s submit method. This will put each function we pass in onto a queue. Worker threads in the pool then pull from the queue, running each work item until it completes. This approach does not yield any performance benefits over using a pool without asyncio, but while we’re waiting for await asyncio.gather to finish, other code can run.
+
+## Default executors
+
+Reading the asyncio documentation, you may notice that the run_in_executor method’s executor parameter can be None. In this case, run_in_executor will use the event loop’s default executor. What is a default executor? Think of it as a reusable singleton executor for your entire application. The default executor will always default to a ThreadPoolExecutor unless we set a custom one with the loop.set_default_executor method. This means that we can simplify the code from listing 7.5, as shown in the following listing.
+
+```Python3
+import functools
+import requests
+import asyncio
+
+
+def get_status_code(url: str) -> int:
+  response = requests.get(url)
+  return response.status_code
+
+
+async def main():
+  loop = asyncio.get_running_loop()
+  urls = ['http://www.example.com' for _ in range(1000)]
+
+  tasks = [loop.run_in_executor(None, functools.partial(get_status_code, url)) for url in urls]
+  results = await asyncio.gather(*tasks)
+
+  print(results)
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we eliminate creating our own ThreadPoolExecutor and using it in a context manager as we did before and, instead, pass in None as the executor. The first time we call run_in_executor, asyncio creates and caches a default thread pool executor for us. Each subsequent call to run_in_executor reuses the previously created default executor, meaning the executor is then global to the event loop. Shutdown of this pool is also different from what we saw before. Previously, the thread pool executor we created was shut down when we exited a context manager’s with block. When using the default executor, it won’t shut down until the event loop closes, which usually happens when our application finishes. Using the default thread pool executor when we want to use threads simplifies things, but can we make this even easier?
+
+In Python 3.9, the asyncio.to_thread coroutine was introduced to further simplify putting work on the default thread pool executor. It takes in a function to run in a thread and a set of arguments to pass to that function. Previously, we had to use functools.partial to pass in arguments, so this makes our code a little cleaner. It then runs the function with its arguments in the default thread pool executor and the currently running event loop. This lets us simplify our threading code even more. Using the to_thread coroutine eliminates using functools.partial and our call to asyncio.get_running_loop, cutting down our total lines of code.
+
+```Python3
+import requests
+import asyncio
+
+
+def get_status_code(url: str) -> int:
+  response = requests.get(url)
+  return response.status_code
+
+
+async def main():
+  urls = ['https://www.example.com' for _ in range(1000)]
+  tasks = [asyncio.to_thread(get_status_code, url) for url in urls]
+  results = await asyncio.gather(*tasks)
+  print(results)
+
+
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+So far, we’ve only seen how to run blocking code inside of threads. The power of combining threads with asyncio is that we can run other code while we’re waiting for our threads to finish. To see how to run other code while threads are running, we’ll revisit our example from chapter 6 of periodically outputting the status of a long-running task.
+
+## Locks, shared data, and deadlocks
+
+Much like multiprocessing code, multithreaded code is also susceptible to race conditions when we have shared data, as we do not control the order of execution. Any time you have two threads or processes that could modify a shared piece of non-thread-safe data, you’ll need to utilize a lock to properly synchronize access. Conceptually, this is no different from the approach we took with multiprocessing; however, the memory model of threads changes the approach slightly.
+
+Recall that with multiprocessing, by default the processes we create do not share memory. This meant we needed to create special shared memory objects and properly initialize them so that each process could read from and write to that object. Since threads do have access to the same memory of their parent process, we no longer need to do this, and threads can access shared variables directly.
+
+This simplifies things a bit, but since we won’t be working with shared Value objects that have locks built in, we’ll need to create them ourselves. To do this, we’ll need to use the threading module’s Lock implementation, which is different from the one we used with multiprocessing. This is as easy as importing Lock from the threading module and calling its acquire and release methods around critical sections of code or using it in a context manager.
+
+To see how to use locks with threading, let’s revisit our task from chapter 6 of keeping track and displaying the progress of a long task. We’ll take our previous example of making thousands of web requests and use a shared counter to keep track of how many requests we’ve completed so far.
+
+```Python3
+import functools
+import requests
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+
+counter_lock = Lock()
+counter: int = 0
+
+
+def get_status_code(url: str) -> int:
+  global counter
+  response = requests.get(url)
+
+  with counter_lock:
+    counter += 1
+
+  return response.status_code
+
+
+async def reporter(request_count: int):
+  while counter < request_count:
+    print(f'Finished {counter}/{request_count} requests')
+    await asyncio.sleep(.5)
+
+
+async def main():
+  loop = asyncio.get_running_loop()
+
+  with ThreadPoolExecutor() as pool:
+    request_count = 200
+    urls = ['https://www.example.com' for _ in range(request_count)]
+    reporter_task = asyncio.create_task(reporter(request_count))
+    tasks = [loop.run_in_executor(pool, functools.partial(get_status_code, url)) for url in urls]
+    results = await asyncio.gather(*tasks)
+    await reporter_task
+    print(results)
+
+
+asyncio.run(main())
+```
+
+This should look familiar, as it is like the code we wrote to output progress of our map operation in chapter 6. We create a global counter variable as well as a counter_lock to synchronize access to it in critical sections. In our get_status_code function we acquire the lock when we increment the counter. Then, in our main coroutine we kick off a reporter background task that outputs how many requests we’ve finished every 500 milliseconds. Running this, you should see output similar to the following:
+
+```
+Finished 0/200 requests
+Finished 48/200 requests
+Finished 97/200 requests
+Finished 163/200 requests
+```
+
+We now know the basics around locks with both multithreading and multiprocessing, but there is still quite a bit to learn about locking. Next, we’ll look at the concept of reentrancy.
+
+## Reentrant locks
+
+Simple locks work well for coordinating access to a shared variable across multiple threads, but what happens when a thread tries to acquire a lock it has already acquired? Is this even safe? Since the same thread is acquiring the lock, this should be okay since this is single-threaded by definition and, therefore, thread-safe.
+
+While this access should be okay, it does cause problems with the locks we have been using so far. To illustrate this, let’s imagine we have a recursive sum function that takes a list of integers and produces the sum of the list. The list we want to sum can be modified from multiple threads, so we need to use a lock to ensure the list we’re summing does not get modified during our sum operation. Let’s try implementing this with a normal lock to see what happens. We’ll also add some console output to see how our function is executing.
+
+```Python3
+from threading import Lock, Thread
+from typing import List
+
+list_lock = Lock()
+
+
+def sum_list(int_list: List[int]) -> int:
+  print('Waiting to acquire lock...')
+
+  with list_lock:
+    print('Acquired lock.')
+    if len(int_list) == 0:
+      print('Finished summing.')
+      return 0
+    else:
+      head, *tail = int_list
+      print('Summing rest of list.')
+      return head + sum_list(tail)
+
+
+thread = Thread(target=sum_list, args=([1, 2, 3, 4],))
+thread.start()
+thread.join()
+```
+
+If you run this code, you’ll see the following few messages and then the application will hang forever:
+
+```
+Waiting to acquire lock...
+Acquired lock.
+Summing rest of list.
+Waiting to acquire lock...
+```
+
+Why is this happening? If we walk through this, we acquire list_lock the first time perfectly fine. We then unpack the list and recursively call sum_list on the remainder of the list. This then causes us to attempt to acquire list_lock a second time. This is where our code hangs because, since we already acquired the lock, we block forever trying to acquire the lock a second time. This also means we never exit the first with block and can’t release the lock; we’re waiting for a lock that will never be released!
+
+Since this recursion is coming from the same thread that originated it, acquiring the lock more than once shouldn’t be a problem as this won’t cause race conditions. To support these use cases, the threading library provides reentrant locks. A reentrant lock is a special kind of lock that can be acquired by the same thread more than once, allowing that thread to “reenter” critical sections. The threading module provides reentrant locks in the RLock class. We can take our above code and fix the problem by modifying only two lines of code—the import statement and the creation of the list_lock:
+
+```Python3
+from threading import Rlock
+
+list_lock = RLock()
+```
+
+If we modify these lines our code will work properly, and a single thread will be able to acquire the lock multiple times. Internally, reentrant locks work by keeping a recursion count. Each time we acquire the lock from the thread that first acquired the lock, the count increases, and each time we release the lock it decreases. When the count is 0, the lock is finally released for other threads to acquire it.
+
+Let’s examine a more real-world application to truly understand the concept of recursion with locks. Imagine we’re trying to build a thread-safe integer list class with a method to find and replace all elements of a certain value with a different value. This class will contain a normal Python list and a lock we use to prevent race conditions. We’ll pretend our existing class already has a method called indices_of(to_ find: int) that takes in an integer and returns all the indices in the list that match to_find. Since we want to follow the DRY (don’t repeat yourself) rule, we’ll reuse this method when we define our find-and-replace method (note this is not the technically the most efficient way to do this, but we’ll do it to illustrate the concept). This means our class and method will look something like the following listing.
+
+```Python3
+from threading import Lock
+from typing import List
+
+
+class IntListThreadsafe:
+  def __init__(self, wrapped_list: List[int]):
+    self._lock = Lock()
+    self._inner_list = wrapped_list
+
+  def indices_of(self, to_find: int) -> List[int]:
+    with self._lock:
+      enumerator = enumerate(self._inner_list)
+      return [index for index, value in enumerator if value == to_find]
+
+  def find_and_replace(self, to_replace: int, replace_with: int) -> None:
+    with self._lock:
+      indices = self.indices_of(to_replace)
+      for index in indices:
+        self._inner_list[index] = replace_with
+
+
+threadsafe_list = IntListThreadsafe([1, 2, 1, 2, 1])
+threadsafe_list.find_and_replace(1, 2)
+```
+
+If someone from another thread modifies the list during our indices_of call, we could obtain an incorrect return value, so we need to acquire the lock before we search for matching indices. Our find_and_replace method must acquire the lock for the same reason. However, with a normal lock we wind up hanging forever when we call find_and_replace. The find-and-replace method first acquires the lock and then calls another method, which tries to acquire the same lock. Switching to an RLock in this case will fix this problem because one call to find_and_replace will always acquire any locks from the same thread. This illustrates a generic formula for when you need to use reentrant locks. If you are developing a thread-safe class with a method A, which acquires a lock, and a method B that also needs to acquire a lock and call method A, you likely need to use a reentrant lock.
+
+## Deadlocks
+
+You may be familiar with the concept of deadlock from political negotiations on the news, where one party makes a demand of the other side, and the other side makes a counterdemand. Both sides disagree on the next step and negotiation reaches a standstill. The concept in computer science is similar in that we reach a state where there is contention over a shared resource with no resolution, and our application hangs forever.
+
+The issue we saw in the previous section, where non-reentrant locks can cause our program to hang forever, is one example of a deadlock. In that case, we reach a state where we’re stuck in a standstill negotiation with ourselves, demanding to acquire a lock that is never released. This situation can also arise when we have two threads using more than one lock. Figure 7.1 illustrates this scenario: if thread A asks for a lock that thread B has acquired, and thread B is asking for a lock that A has acquired, we reach a standstill and a deadlock. In that instance, using reentrant locks won’t help, as we have multiple threads stuck waiting on a resource the other thread holds.
+
+![Figure](ScreenshotsForNotes/Chapter7/Figure_7_1.PNG)
+
+Let’s look at how to create this type of deadlock in code. We’ll create two locks, lock A and B, and two methods which need to acquire both locks. One method will acquire A first and then B and another will acquire B first and then A.
+
+```Python3
+from threading import Lock, Thread
+import time
+
+lock_a = Lock()
+lock_b = Lock()
+
+
+def a():
+  # Acquire lock A.
+  with lock_a:
+    print('Acquired lock a from method a!')
+    # Sleep for 1 seconds; this ensures we create the right conditions for deadlock
+    time.sleep(1)
+    with lock_b:
+      print('Acquired both locks from method a!')
+
+
+def b():
+  # Acquire lock B.
+  with lock_b:
+    print('Acquired lock b from method b!')
+    # Sleep for 1 seconds; this ensures we create the right conditions for deadlock
+    time.sleep(1)
+
+    # Acquire lock A.
+    with lock_a:
+      print('Acquired both locks from method b!')
+
+
+thread1 = Thread(target=a)
+thread2 = Thread(target=b)
+
+thread1.start()
+thread2.start()
+
+thread1.join()
+thread2.join()
+```
+
+When we run this code, we’ll see the following output, and our application will hang forever:
+
+```
+Acquired lock a from method a!
+Acquired lock b from method b!
+```
+
+We first call method A and acquire lock A, then we introduce an artificial delay to give method B a chance to acquire lock B. This leaves us in a state where method A holds lock A and method B holds lock B. Next, method A attempts to acquire lock B, but method B is holding that lock. At the same time, method B tries to acquire lock A, but method A is holding it, stuck waiting for B to release its lock. Both methods are stuck waiting on one another to release a resource, and we reach a standstill.
+
+How do we handle this situation? One solution is the so-called “ostrich algorithm,” named for the situation (although ostriches don’t actually behave this way) where an ostrich sticks its head in the sand whenever it senses danger. With this strategy, we ignore the problem and devise a strategy to restart our application when we encounter the issue. The driving idea behind this approach is if the issue happens rarely enough, investing in a fix isn’t worth it. If you remove the sleep from the above code, you’ll only rarely see deadlock occur, as it relies on a very specific sequence of operations. This isn’t really a fix and isn’t ideal but is a strategy used with deadlocks that rarely occur.
+
+However, in our situation there is an easy fix, where we change the locks in both methods to always be acquired in the same order. For instance, both methods A and B can acquire lock A first then lock B. This resolves the issue, as we’ll never acquire locks in an order where a deadlock could occur. The other option would be to refactor the locks so we use only one instead of two. It is impossible to have a deadlock with one lock (excluding the reentrant deadlock we saw earlier). Overall, when dealing with multiple locks that you need to acquire, ask yourself, “Am I acquiring these locks in a consistent order? Is there a way I can refactor this to use only one lock?”
+
+We’ve now seen how to use threads effectively with asyncio and have investigated more complex locking scenarios. Next, let’s see how to use threads to integrate asyncio into existing synchronous applications that may not work smoothly with asyncio.
+
+## Using threads for CPU-bound work
+
+The global interpreter lock is a tricky subject in Python. The rule of thumb is multithreading only makes sense for blocking I/O work, as I/O will release the GIL. This is true in most cases but not all. To properly release the GIL and avoid any concurrency bugs, the code that is running needs to avoid interacting with Python objects (dictionaries, lists, Python integers, and so on). This can happen when a large portion of our libraries’ work is done in low-level C code. There are a few notable libraries, such as hashlib and NumPy, that perform CPU-intensive work in pure C and release the GIL. This enables us to use multithreading to improve the performance of certain CPU bound workloads.
+
+### Multithreading with hashlib
+
+In today’s world, security has never been more important. Ensuring that data is not read by hackers is key to avoiding leaking sensitive customer data, such as passwords or other information that can be used to identify or harm them.
+
+Hashing algorithms solve this problem by taking a piece of input data and creating a new piece of data that is unreadable and unrecoverable (if the algorithm is secure) to a human. For example, the password “password” may be hashed to a string that looks more like 'a12bc21df'. While no one can read or recover the input data, we’re still able to check if a piece of data matches a hash. This is useful for scenarios such as validating a user’s password on login or checking if a piece of data has been tampered with.
+
+There are many different hashing algorithms today, such as SHA512, BLAKE2, and scrypt, though SHA is not the best choice for storing passwords, as it is susceptible to brute-force attacks. Several of these algorithms are implemented in Python’s hashlib library. Many functions in this library release the GIL when hashing data greater than 2048 bytes, so multithreading is an option to improve this library’s performance. In addition, the scrypt function, used for hashing passwords, always releases the GIL.
+
+Let’s introduce a (hopefully) hypothetical scenario to see when multithreading might be useful with hashlib. Imagine you’ve just started a new job as principal software architect at a successful organization. Your manager assigns you your first bug to get started learning the company’s development process—a small issue with the login system. To debug this issue, you start to look at a few database tables, and to your horror you notice that all your customers’ passwords are stored in plaintext! This means that if your database is compromised, attackers could get all your customers’ passwords and log in as them, potentially exposing sensitive data such as saved credit card numbers. You bring this to your manager’s attention, and they ask you to find a solution to the problem as soon as possible.
+
+Using the scrypt algorithm to hash the plaintext passwords is a good solution for this kind of problem. It is secure and the original password is unrecoverable, as it introduces a salt. A salt is a random number that ensures that the hash we get for the password is unique. To test out using scrypt, we can quickly write a synchronous script to create random passwords and hash them to get a sense of how long things will take. For this example, we’ll test on 10,000 random passwords.
+
+```Python3
+import hashlib
+import os
+import string
+import time
+import random
+
+
+def random_password(length: int) -> bytes:
+  ascii_lowercase = string.ascii_lowercase.encode()
+  return b''.join(bytes(random.choice(ascii_lowercase)) for _ in range(length))
+
+
+passwords = [random_password(10) for _ in range(10000)]
+
+
+def hash(password: bytes) -> str:
+  salt = os.urandom(16)
+  return str(hashlib.scrypt(password, salt=salt, n=2048, p=1, r=8))
+
+
+start = time.perf_counter()
+
+for password in passwords:
+  hash(password)
+
+end = time.perf_counter()
+
+print(end - start)
+```
+
+We first write a function to create random lowercase passwords and then use that to create 10,000 random passwords of 10 characters each. We then hash each password with the scrypt function. We’ll gloss over the details (n, p, and r parameters of the scrypt function), but these are used to tune how secure we’d like our hash to be and memory/CPU usage.
+
+Running this on the servers you have, which are 2.4 Ghz 8-core machines, this code completes in just over 40 seconds, which is not too bad. The issue is that you have a large user base, and you need to hash 1,000,000,000 passwords. Doing the calculation based on this test, it will take a bit over 40 days to hash the entire database! We could split up our data set and run this procedure on multiple machines, but we’dneed a lot of machines to do that, given how slow this is. Can we use threading to improve the speed and therefore cut down on the time and machines we need to use? Let’s apply what we know about multithreading to give this a shot. We’ll create a thread pool and hash passwords in multiple threads.
+
+```Python3
+import asyncio
+import functools
+import hashlib
+import os
+from concurrent.futures.thread import ThreadPoolExecutor
+import random
+import string
+
+
+def random_password(length: int) -> bytes:
+  ascii_lowercase = string.ascii_lowercase.encode()
+  return b''.join(bytes(random.choice(ascii_lowercase)) for _ in range(length))
+
+
+passwords = [random_password(10) for _ in range(10000)]
+
+
+def hash(password: bytes) -> str:
+  salt = os.urandom(16)
+  return str(hashlib.scrypt(password, salt=salt, n=2048, p=1, r=8))
+
+
+async def main():
+  loop = asyncio.get_running_loop()
+  tasks = []
+
+  with ThreadPoolExecutor() as pool:
+    for password in passwords:
+      tasks.append(loop.run_in_executor(pool, functools.partial(hash, password)))
+
+  await asyncio.gather(*tasks)
+
+
+asyncio.run(main())
+```
+
+This approach involves us creating a thread pool executor and creating a task for each password we want to hash. Since hashlib releases the GIL we realize some decent performance gains. This code runs in about 5 seconds as opposed to the 40 we got earlier. We’ve just cut our runtime down from 47 days to a bit over 5! As a next step, we could take this application and run it concurrently on different machines to further cut runtime, or we could get a machine with more CPU cores
