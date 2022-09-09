@@ -3405,3 +3405,433 @@ Transmitting data to and from a socket is only part of the equation. What about 
 # 10. Microservices
 
 \-
+
+# 11. Synchronization
+
+## Understanding single-threaded concurrency bugs
+
+In earlier chapters on multiprocessing and multithreading, recall that when we were working with data that is shared among different processes and threads, we had to worry about race conditions. This is because a thread or process could read data while it is being modified by a different thread or process, leading to an inconsistent state and therefore corruption of data.
+
+This corruption was in part due to some operations being non-atomic, meaning that while they appear like one operation, they comprise multiple separate operations under the hood. The example we gave in chapter 6 dealt with incrementing an integer variable; first, we read the current value, then we increment it, then we reassign it back to the variable. This gives other threads and processes ample opportunities to get data in an inconsistent state.
+
+In a single-threaded concurrency model, we avoid race conditions caused by nonatomic operations. In asyncio’s single-threaded model, we only have one thread executing one line of Python code at any given time. This means that even if an operation is non-atomic, we’ll always run it to completion without other coroutines reading inconsistent state information.
+
+To prove this to ourselves, let’s try and re-create the race condition we looked at in chapter 7 with multiple threads trying to implement a shared counter. Instead of having multiple threads modify the variable, we’ll have multiple tasks. We’ll repeat this 1,000 times and assert that we get the correct value back.
+
+```Python3
+import asyncio
+
+counter: int = 0
+
+
+async def increment():
+  global counter
+  await asyncio.sleep(0.01)
+  counter += 1
+
+
+async def main():
+  global counter
+  for _ in range(1000):
+    tasks = [asyncio.create_task(increment()) for _ in range(100)]
+    await asyncio.gather(*tasks)
+    print(f'Counter is {counter}')
+    assert counter == 100
+    counter = 0
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we create an increment coroutine function that adds one to a global counter, adding a 1-millisecond delay to simulate a slow operation. In our main coroutine, we create 100 tasks to increment the counter and then run them all concurrently with gather. We then assert that our counter is the expected value, which, since we ran 100 increment tasks, should always be 100. Running this, you should see that the value we get is always 100 even though incrementing an integer is non-atomic. If we ran multiple threads instead of coroutines, we should see our assertion fail at some point in execution.
+
+Does this mean that with a single-threaded concurrency model we’ve found a way to completely avoid race conditions? Unfortunately, it’s not quite the case. While we avoid race conditions where a single non-atomic operation can cause a bug, we still have the problem where multiple operations executed in the wrong order can cause issues. To see this in action, let’s make incrementing an integer in the eyes of asyncio non-atomic.
+
+To do this, we’ll replicate what happens under the hood when we increment a global counter. We read the global value, increment it, then write it back. The basic idea is if other code modifies state while our coroutine is suspended on an await, once the await finishes we may be in an inconsistent state.
+
+```Python3
+import asyncio
+
+counter: int = 0
+
+
+async def increment():
+  global counter
+  temp_counter = counter
+  temp_counter = temp_counter + 1
+  await asyncio.sleep(0.01)
+  counter = temp_counter
+
+
+async def main():
+  global counter
+  for _ in range(1000):
+    tasks = [asyncio.create_task(increment()) for _ in range(100)]
+    await asyncio.gather(*tasks)
+    print(f'Counter is {counter}')
+    assert counter == 100
+    counter = 0
+
+
+asyncio.run(main())
+```
+
+Instead of our increment coroutine directly incrementing the counter, we first read it into a temporary variable and then increment the temporary counter by one. We then await asyncio.sleep to simulate a slow operation, suspending our coroutine, and only then do we reassign it back to the global counter variable. Running this, you should see this code fail with an assertion error instantly, and our counter only ever gets set to 1! Each coroutine reads the counter value first, which is 0, stores it to a temp value, then goes to sleep. Since we’re single-threaded, each read to a temporary variable runs sequentially, meaning each coroutine stores the value of counter as 0 and increments this to 1. Then, once the sleep is finished, every coroutine sets the value of the counter to 1, meaning despite running 100 coroutines to increment our counter, our counter is only ever 1. Note that if you remove the await expression, things will operate in the correct order because there is no opportunity to modify the application state while we’re paused at an await point.
+
+These are the types of bugs you tend to see in a single-threaded concurrency model. You hit a suspension point with await, and another coroutine runs and modifies some shared state, changing it for the first coroutine once it resumes in an undesired way. The key difference between multithreaded concurrency bugs and singlethreaded concurrency bugs is that in a multithreaded application, race conditions are possible anywhere you modify a mutable state. In a single-threaded concurrency model, you need to modify the mutable state during an await point. Now that we understand the types of concurrency bugs in a single-threaded model, let’s see how to avoid them by using asyncio locks.
+
+## Locks
+
+asyncio locks operate similarly to the locks in the multiprocessing and multithreading modules. We acquire a lock, do work inside of a critical section, and when we’re done, we release the lock, letting other interested parties acquire it. The main difference is that asyncio locks are awaitable objects that suspend coroutine execution when they are blocked. This means that when a coroutine is blocked waiting to acquire a lock, other code can run. In addition, asyncio locks are also asynchronous context managers, and the preferred way to use them is with async with syntax.
+
+To get familiar with how locks work, let’s look at a simple example with one lock shared between two coroutines. We’ll acquire the lock, which will prevent other coroutines from running code in the critical section until someone releases it.
+
+```Python3
+import asyncio
+from asyncio import Lock
+
+
+async def delay(delay_seconds: int) -> int:
+  print("Sleeping for {0} second(s)".format(delay_seconds))
+  await asyncio.sleep(delay_seconds)
+  print("Finished sleeping for {0} second(s)".format(delay_seconds))
+  return delay_seconds
+
+
+async def a(lock: Lock):
+  print('Coroutine a waiting to acquire the lock')
+  async with lock:
+    print('Coroutine a is in the critical section')
+    await delay(2)
+  print('Coroutine a released the lock')
+
+
+async def b(lock: Lock):
+  print('Coroutine b waiting to acquire the lock')
+  async with lock:
+    print('Coroutine b is in the critical section')
+    await delay(2)
+  print('Coroutine b released the lock')
+
+
+async def main():
+  lock = Lock()
+  await asyncio.gather(a(lock), b(lock))
+
+
+asyncio.run(main())
+```
+
+When we run the preceding listing, we will see that coroutine a acquires the lock first, leaving coroutine b waiting until a releases the lock. Once a releases the lock, b can do its work in the critical section, giving us the following output:
+
+```
+Coroutine a waiting to acquire the lock
+Coroutine a is in the critical section
+sleeping for 2 second(s)
+Coroutine b waiting to acquire the lock
+finished sleeping for 2 second(s)
+Coroutine a released the lock
+Coroutine b is in the critical section
+sleeping for 2 second(s)
+finished sleeping for 2 second(s)
+Coroutine b released the lock
+```
+
+Here we used async with syntax. If we had wanted, we could use the acquire and release methods on the lock like so:
+
+```Python3
+await lock.acquire()
+
+try:
+    print('In critical section')
+finally:
+    lock.release()
+```
+
+That said, it is best practice to use async with syntax where possible.
+
+One important thing to note is that we created the lock inside of the main coroutine. Since the lock is shared globally amongst the coroutines we create, we may be tempted to make it a global variable to avoid passing it in each time like so:
+
+```Python3
+lock = Lock()
+
+# coroutine definitions
+async def main():
+    await asyncio.gather(a(), b())
+```
+
+If we do this, we’ll quickly see a crash with an error reporting multiple event loops:
+
+```Task <Task pending name='Task-3' coro=<b()> got Future <Future pending> attached to a different loop```
+
+Why is this happening when all we’ve done is move our lock definition? This is a confusing quirk of the asyncio library and is not unique to just locks. Most objects in asyncio provide an optional loop parameter that lets you specify the specific event loop to run in. When this parameter is not provided, asyncio tries to get the currently running event loop, but if there is none, it creates a new one. In the above case, creating a Lock creates a new event loop, since when our script first runs we haven’t yet created one. Then, asyncio.run(main()) creates a second event loop, and when we attempt to use our lock we intermingle these two separate event loops, which causes a crash.
+
+This behavior is tricky enough that in Python 3.10, event loop parameters are going to be removed, and this confusing behavior will go away, but until then you’ll need to think through these cases when using global asyncio variables carefully.
+
+## Limiting concurrency with semaphores
+
+Resources that our applications need to use are often finite. We may have a limited number of connections we can use concurrently with a database; we may have a limited number of CPUs that we don’t want to overload; or we may be working with an API that only allows a few concurrent requests, based on our current subscription pricing. We could also be using our own internal API and may be concerned with overwhelming it with load, effectively launching a distributed denial of service attack against ourselves.
+
+Semaphores are a construct that can help us out in these situations. A semaphore acts much like a lock in that we can acquire it and we can release it, with the major difference being that we can acquire it multiple times up to a limit we specify. Internally, a semaphore keeps track of this limit; each time we acquire the semaphore we decrement the limit, and each time we release the semaphore we increment it. If the count reaches zero, any further attempts to acquire the semaphore will block until someone else calls release and increments the count. To draw parallels to what we just learned with locks, you can think of a lock as a special case of a semaphore with a limit of one.
+
+To see semaphores in action, let’s build a simple example where we only want two tasks running at the same time, but we have four tasks to run in total. To do this, we’ll create a semaphore with a limit of two and acquire it in our coroutine.
+
+```Python3
+import asyncio
+from asyncio import Semaphore
+
+
+async def operation(semaphore: Semaphore):
+  print('Waiting to acquire semaphore...')
+  async with semaphore:
+    print('Semaphore acquired!')
+    await asyncio.sleep(2)
+  print('Semaphore released!')
+
+
+async def main():
+  semaphore = Semaphore(2)
+  await asyncio.gather(*[operation(semaphore) for _ in range(4)])
+
+
+asyncio.run(main())
+```
+
+In our main coroutine, we create a semaphore with a limit of two, indicating we can acquire it twice before additional acquisition attempts start to block. We then create four concurrent calls to operation—this coroutine acquires the semaphore with an async with block and simulates some blocking work with sleep. When we run this, we’ll see the following output:
+
+```
+Waiting to acquire semaphore...
+Semaphore acquired!
+Waiting to acquire semaphore...
+Semaphore acquired!
+Waiting to acquire semaphore...
+Waiting to acquire semaphore...
+Semaphore released!
+Semaphore released!
+Semaphore acquired!
+Semaphore acquired!
+Semaphore released!
+Semaphore released!
+```
+
+Since our semaphore only allows two acquisitions before it blocks, our first two tasks successfully acquire the lock while our other two tasks wait for the first two tasks to release the semaphore. Once the work in the first two tasks finishes and we release the semaphore, our other two tasks can acquire the semaphore and start doing their work.
+
+### Bounded semaphores
+
+One aspect of semaphores is that it is valid to call release more times than we call acquire. If we always use semaphores with an async with block, this isn’t possible, since each acquire is automatically paired with a release. However, if we’re in a situation where we need finer-grained control over our releasing and acquisition mechanisms (for example, perhaps we have some branching code where one branch lets us release earlier than another), we can run into issues. As an example, let’s see what happens when we have a normal coroutine that acquires and releases a semaphore with an async with block, and while that coroutine is executing another coroutine calls release.
+
+```Python3
+import asyncio
+from asyncio import Semaphore
+
+
+async def acquire(semaphore: Semaphore):
+  print('Waiting to acquire')
+  async with semaphore:
+    print('Acquired')
+    await asyncio.sleep(5)
+  print('Releasing')
+
+
+async def release(semaphore: Semaphore):
+  print('Releasing as a one off!')
+  semaphore.release()
+  print('Released as a one off!')
+
+
+async def main():
+  semaphore = Semaphore(2)
+
+  print('Acquiring twice, releasing three times...')
+  await asyncio.gather(acquire(semaphore), acquire(semaphore), release(semaphore))
+
+  print('Acquiring three times...')
+  await asyncio.gather(acquire(semaphore), acquire(semaphore), acquire(semaphore))
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we create a semaphore with two permits. We then run two calls to acquire and one call to release, meaning we’ll call release three times. Our first call to gather seems to run okay, giving us the following output:
+
+```
+Acquiring twice, releasing three times...
+Waiting to acquire
+Acquired
+Waiting to acquire
+Acquired
+Releasing as a one off!
+Released as a one off!
+Releasing
+Releasing
+```
+
+However, our second call where we acquire the semaphore three times runs into issues, and we acquire the lock three times at once! We’ve inadvertently increased the number of permits our semaphore has available:
+
+```
+Acquiring three times...
+Waiting to acquire
+Acquired
+Waiting to acquire
+Acquired
+Waiting to acquire
+Acquired
+Releasing
+Releasing
+Releasing
+```
+
+To deal with these types of situations, asyncio provides a BoundedSemaphore. This semaphore behaves exactly as the semaphore we’ve been using, with the key difference being that release will throw a ValueError: BoundedSemaphore released too many times exception if we call release such that it would change the available permits. Let’s look at a very simple example in the following listing.
+
+```Python3
+import asyncio
+from asyncio import BoundedSemaphore
+
+
+async def main():
+  semaphore = BoundedSemaphore(1)
+
+  await semaphore.acquire()
+  semaphore.release()
+  semaphore.release()
+
+
+asyncio.run(main())
+```
+
+When we run the preceding listing, our second call to release will throw a ValueError indicating we’ve released the semaphore too many times. You’ll see similar results if you change the code in listing 11.8 to use a BoundedSemaphore instead of a Semaphore. If you’re manually calling acquire and release such that dynamically increasing the number of permits your semaphore has available would be an error, it is wise to use a BoundedSemaphore, so you’ll see an exception to warn you of the mistake.
+
+We’ve now seen how to use semaphores to limit concurrency, which can be useful in situations where we need to constrain concurrency within our applications. asyncio synchronization primitives not only allow us to limit concurrency but also allow us to notify tasks when something happens. Next, let’s see how to do this with the Event synchronization primitive.
+
+## Notifying tasks with events
+
+Sometimes, we may need to wait for some external event to happen before we can proceed. We might need to wait for a buffer to fill up before we can begin to process it, we might need to wait for a device to connect to our application, or we may need to wait for some initialization to happen. We may also have multiple tasks waiting to process data that may not yet be available. Event objects provide a mechanism to help us out in situations where we want to idle while waiting for something specific to happen.
+
+Internally, the Event class keeps track of a flag that indicates whether the event has happened yet. We can control this flag is with two methods, set and clear. The set method sets this internal flag to True and notifies anyone waiting that the event happened. The clear method sets this internal flag to False, and anyone who is waiting for the event will now block.
+
+With these two methods, we can manage internal state, but how do we block until an event happens? The Event class has one coroutine method named wait. When we await this coroutine, it will block until someone calls set on the event object. Once this occurs, any additional calls to wait will not block and will return instantly. If we call clear once we have called set, then calls to wait will start blocking again until we call set again.
+
+Let’s create a dummy example to see events in action. We’ll pretend we have two tasks that are dependent on something happening. We’ll have these tasks wait and idle until we trigger the event.
+
+```Python3
+import asyncio
+import functools
+from asyncio import Event
+
+
+def trigger_event(event: Event):
+  event.set()
+
+
+async def do_work_on_event(event: Event):
+  print('Waiting for event...')
+
+  # Wait until the event occurs
+  await event.wait()
+
+  print('Performing work!')
+
+  # Once the event occurs, wait will no longer block, and we can do work.
+  await asyncio.sleep(1)
+
+  print('Finished work!')
+
+  # Reset the event, so future calls to wait will block.
+  event.clear()
+
+
+async def main():
+  event = asyncio.Event()
+  # Trigger the event 5 seconds in the future.
+  asyncio.get_running_loop().call_later(5.0, functools.partial(trigger_event, event))
+  await asyncio.gather(do_work_on_event(event), do_work_on_event(event))
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we create a coroutine method do_work_on_event, this coroutine takes in an event and first calls its wait coroutine. This will block until someone calls the event’s set method to indicate the event has happened. We also create a simple method trigger_event, which sets a given event. In our main coroutine, we create an event object and use call_later to trigger the event 5 seconds in the future. We then call do_work_on_event twice with gather, which will create two concurrent tasks for us. We’ll see the two do_work_on_event tasks idle for 5 seconds until we trigger the event, after which we’ll see them do their work, giving us the following output:
+
+```
+Waiting for event...
+Waiting for event...
+Triggering event!
+Performing work!
+Performing work!
+Finished work!
+Finished work!
+```
+
+This shows us the basics; waiting on an event will block one or more coroutines until we trigger an event, after which they can proceed to do work.
+
+## Conditions
+
+Events are good for simple notifications when something happens, but what about more complex use cases? Imagine needing to gain access to a shared resource that requires a lock on an event, waiting for a more complex set of facts to be true before proceeding or waking up only a certain number of tasks instead of all of them. Conditions can be useful in these types of situations. They are by far the most complex synchronization primitives we’ve encountered so far, and as such, you likely won’t need to use them all that often.
+
+A condition combines aspects of a lock and an event into one synchronization primitive, effectively wrapping the behavior of both. We first acquire the condition’s lock, giving our coroutine exclusive access to any shared resource, allowing us to safely change any state we need. Then, we wait for a specific event to happen with the wait or wait_for coroutine. These coroutines release the lock and block until the event happens, and once it does it reacquires the lock giving us exclusive access.
+
+Since this is a bit confusing, let’s create a dummy example to understand how to use conditions. We’ll create two worker tasks that each attempt to acquire the condition lock and then wait for an event notification. Then, after a few seconds, we’ll trigger the condition, which will wake up the two worker tasks and allow them to do work.
+
+```Python3
+import asyncio
+import functools
+from asyncio import Event
+
+
+def trigger_event(event: Event):
+  event.set()
+
+
+async def do_work_on_event(event: Event):
+  print('Waiting for event...')
+
+  # Wait until the event occurs
+  await event.wait()
+
+  print('Performing work!')
+
+  # Once the event occurs, wait will no longer block, and we can do work.
+  await asyncio.sleep(1)
+
+  print('Finished work!')
+
+  # Reset the event, so future calls to wait will block.
+  event.clear()
+
+
+async def main():
+  event = asyncio.Event()
+  # Trigger the event 5 seconds in the future.
+  asyncio.get_running_loop().call_later(5.0, functools.partial(trigger_event, event))
+  await asyncio.gather(do_work_on_event(event), do_work_on_event(event))
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we create two coroutine methods: do_work and fire_event. The do_work method acquires the condition, which is analogous to acquiring a lock, and then calls the condition’s wait coroutine method. The wait coroutine method will block until someone calls the condition’s notify_all method.
+
+The fire_event coroutine method sleeps for a little bit and then acquires the condition and calls the notify_all method, which will wake up any tasks that are currently waiting on the condition. Then, in our main coroutine we create one fire_event task and two do_work tasks and run them concurrently. When running this you’ll see the following repeated if the application runs:
+
+```
+Worker 1: waiting for condition lock...
+Worker 1: acquired lock, releasing and waiting for condition...
+Worker 2: waiting for condition lock...
+Worker 2: acquired lock, releasing and waiting for condition...
+fire_event: about to notify, acquiring condition lock...
+fire_event: Lock acquired, notifying all workers.
+fire_event: Notification finished, releasing lock.
+Worker 1: condition event fired, re-acquiring lock and doing work...
+Worker 1: Work finished, lock released.
+Worker 1: waiting for condition lock...
+Worker 2: condition event fired, re-acquiring lock and doing work...
+Worker 2: Work finished, lock released.
+Worker 2: waiting for condition lock...
+Worker 1: acquired lock, releasing and waiting for condition...
+Worker 2: acquired lock, releasing and waiting for condition...
+```
+
+You’ll notice that the two workers start right away and block waiting for the fire_ event coroutine to call notify_all. Once fire_event calls notify_all, the worker tasks wake up and then proceed to do their work.
+
+Conditions have an additional coroutine method called wait_for. Instead of blocking until someone notifies the condition, wait_for accepts a predicate (a no-argument-function that returns a Boolean) and will block until that predicate returns True. This proves useful when there is a shared resource with some coroutines dependent on certain states becoming true.
+
