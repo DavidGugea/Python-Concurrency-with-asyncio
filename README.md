@@ -3835,3 +3835,6 @@ You’ll notice that the two workers start right away and block waiting for the 
 
 Conditions have an additional coroutine method called wait_for. Instead of blocking until someone notifies the condition, wait_for accepts a predicate (a no-argument-function that returns a Boolean) and will block until that predicate returns True. This proves useful when there is a shared resource with some coroutines dependent on certain states becoming true.
 
+# 12. Asynchronous queues
+
+\-
