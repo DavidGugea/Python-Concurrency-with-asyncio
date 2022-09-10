@@ -3838,3 +3838,127 @@ Conditions have an additional coroutine method called wait_for. Instead of block
 # 12. Asynchronous queues
 
 \-
+
+# 13. Managing subprocesses
+
+## Introduction
+
+Many applications will never need to leave the world of Python. We’ll call code from other Python libraries and modules or use multiprocessing or multithreading to run Python code concurrently. However, not everything we’ll want to interact with is written in Python. We may have an already built application that is written in C++, Go, Rust, or some other language that provides better runtime characteristics or is simply already there for us to use without reimplementing. We may also want to use OS provided command-line utilities, such as GREP for searching through large files, cURL for making HTTP requests, or any of the numbers of applications we have at our disposal.
+
+In standard Python, we can use the subprocess module to run different applications in separate processes. Like most other Python modules, the standard subprocess API is blocking, making it incompatible with asyncio without multithreading or multiprocessing. asyncio provides a module modeled on the subprocess module to create and manage subprocesses asynchronously with coroutines.
+
+In this chapter, we’ll learn the basics of creating and managing subprocesses with asyncio by running an application written in a different language. We’ll also learn how to handle input and output, reading standard output, and sending input from our application to our subprocesses.
+
+## Creating a subprocess
+
+Suppose you’d like to extend the functionality of an existing Python web API. Another team within your organization has already built the functionality you’d like in a command-line application for a batch processing mechanism they have, but there is a major problem in that the application is written in Rust. Given the application already exists, you don’t want to reinvent the wheel by reimplementing it in Python. Is there a way we can still use this application’s functionality within our existing Python API?
+
+Since this application has a command-line interface, we can use subprocesses to reuse this application. We’ll call the application via its command-line interface and run it in a separate subprocess. We can then read the results of the application and use it within our existing API as needed, saving us the trouble of having to reimplement the application.
+
+So how do we create a subprocess and execute it? asyncio provides two coroutine functions out of the box to create subprocesses: asyncio.create_subprocess_shell and asyncio.create_subprocess_exec. Each of these coroutine functions returns an instance of a Process, which has methods to let us wait for the process to finish and terminate the process as well as a few others. Why are there two coroutines to accomplish seemingly the same task? When would we want to use one over the other? The create_subprocess_shell coroutine function creates a subprocess within a shell installed on the system it runs on such as zsh or bash. Generally speaking, you’ll want to use create_subprocess_exec unless you need to use functionality from the shell. Using the shell can have pitfalls, such as different machines having different shells or the same shell configured differently. This can make it hard to guarantee your application will behave the same on different machines.
+
+To learn the basics of how to create a subprocess, let’s write an asyncio application to run a simple command-line program. We’ll start with the ls program, which lists the contents of the current directory to test things out, although we wouldn’t likely do this in the real world. If you’re running on a Windows machine, replace ls -l with cmd /c dir.
+
+```Python3
+import asyncio
+from asyncio.subprocess import Process
+
+
+async def main():
+    process: Process = await asyncio.create_subprocess_exec('ls', '-l')
+    print(f'Process pid is: {process.pid}')
+    status_code = await process.wait()
+    print(f'Status code: {status_code}')
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we create a Process instance to run the ls command with create_subprocess_exec. We can also specify other arguments to pass to the program by adding them after. Here we pass in -l, which adds some extra information around who created the files in the directory. Once we’ve created the process, we print out the process ID and then call the wait coroutine. This coroutine will wait until the process finishes, and once it does it will return the subprocesses status code; in this case it should be zero. By default, standard output from our subprocess will be piped to standard output of our own application, so when you run this you should see something like the following, differing based in what you have in your directory:
+
+```
+Process pid is: 54438
+total 8
+drwxr-xr-x 4 matthewfowler staff 128 Dec 23 15:20 .
+drwxr-xr-x 25 matthewfowler staff 800 Dec 23 14:52 ..
+-rw-r--r-- 1 matthewfowler staff 0 Dec 23 14:52 __init__.py
+-rw-r--r-- 1 matthewfowler staff 293 Dec 23 15:20 basics.py
+Status code: 0
+```
+
+Note that the wait coroutine will block until the application terminates, and there are no guarantees as to how long a process will take to terminate, let alone if it will terminate at all. If you’re concerned about a runaway process, you’ll need to introduce a timeout with asyncio.wait_for. There is a caveat to this, however. Recall that wait_ for will terminate the coroutine that it is running if it times out. You may assume that this will terminate the process, but it does not. It only terminates the task that is waiting for the process to finish, and not the underlying process.
+
+We’ll need a better way to shut down the process when it times out. Luckily, Process has two methods that can help us out in this situation: terminate and kill. The terminate method will send the SIGTERM signal to the subprocess, and kill will send the SIGKILL signal. Note that both these methods are not coroutines and are also nonblocking. They just send the signal. If you want to try and get the return code once you’ve terminated the subprocess or you want to wait for any cleanup, you’ll need to call wait again.
+
+Let’s test out terminating a long-running application with the sleep command line application (for Windows users, replace 'sleep', '3' with the more complicated 'cmd', 'start', '/wait', 'timeout', '3'). We’ll create a subprocess that sleeps for a few seconds and try to terminate it before it has a chance to finish.
+
+```Python3
+import asyncio
+from asyncio.subprocess import Process
+
+
+async def main():
+    process: Process = await asyncio.create_subprocess_exec('sleep', '3')
+    print(f'Process pid is: {process.pid}')
+    
+    try:
+        status_code = await asyncio.wait_for(process.wait(), timeout=1.0)
+        print(status_code)
+    except asyncio.TimeoutError:
+        print('Timed out waiting to finish, terminating...')
+        process.terminate()
+        status_code = await process.wait()
+        print(status_code)
+
+
+asyncio.run(main())
+```
+
+In the preceding listing, we create a subprocess that will take 3 seconds to complete but wrap it in a wait_for with a 1-second timeout. After 1 second, wait_for will throw a TimeoutError, and in the except block we terminate the process and wait for it to finish, printing out its status code. This should give us output similar to the following:
+
+```
+Process pid is: 54709
+Timed out waiting to finish, terminating...
+-15
+```
+
+One thing to watch out for when writing your own code is the wait inside of the except block still has a chance of taking a long time, and you may want to wrap this in a wait_for if this is a concern.
+
+## Controlling standard output
+
+In the previous examples, the standard output of our subprocess went directly to our application’s standard output. What if we don’t want this behavior? Perhaps we want to do additional processing on the output, or maybe the output is inconsequential, and we can safely ignore it. The create_subprocess_exec coroutine has a stdout parameter that let us specify where we want standard output to go. This parameter takes in an enum that lets us specify if we want to redirect the subprocess’s output to our own standard output, pipe it to a StreamReader, or ignore it entirely by redirecting it to /dev/null.
+
+Let’s say we’re planning to run multiple subprocesses concurrently and echo their output. We’d like to know which subprocess generated the output to avoid confusion. To make this output easier to read, we’ll add some extra data about which subprocess generated the output before writing it to our application’s standard output. We’ll prepend the command that generated the output before printing it out.
+
+## Communicating with subprocesses
+
+Up to this point, we’ve been using one-way, noninteractive communication with processes. But what if we’re working with an application that may require user input? For example, we may be asked for a passphrase, username, or any other number of inputs.
+
+In the case in which we know we only have one piece of input to deal with, using communicate is ideal. We saw this previously using gpg to send in text to encrypt, but let’s try it when the subprocess explicitly asks for input. We’ll first create a simple Python program to ask for a username and echo it to standard output.
+
+```Python3
+username = input('Please enter a username: ')
+print(f'Your username is {username}')
+```
+
+Now, we can use communicate to input the username.
+
+```Python3
+import asyncio
+from asyncio.subprocess import Process
+
+
+async def main():
+    program = ['python3', 'Listing_13_9.py']
+    process: Process = await asyncio.create_subprocess_exec(*program, stdout=asyncio.subprocess.PIPE,
+                                                            stdin=asyncio.subprocess.PIPE)
+
+    stdout, stderr = await process.communicate(b'TestUsername')
+    print(stdout)
+    print(stderr)
+
+
+asyncio.run(main())
+```
+
+When we run this code, we’ll see b'Please enter a username: Your username is TestUsername\n' printed to the console, as our application terminates right after our first user input. This won’t work if we have a more interactive application. For example, take this application, which repeatedly asks for user input and echoes it until the user types quit
